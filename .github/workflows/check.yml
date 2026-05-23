@@ -34,4 +34,6 @@ jobs:
           node-version: ${{ matrix.node-version }}
 
       - name: Run project checks
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         run: npm run check

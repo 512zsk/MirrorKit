@@ -11,6 +11,6 @@
     "cmsMediaHost": "https://storage.example.com/example-bucket",
     "remoteAssetPrefixes": [],
     "remoteMirrors": [],
-    "ignoredPathPrefixes": [],
-    "sitePathPrefixes": []
+    "ignoredPathPrefixes": ["/.well-known/", "/bb-mcp"],
+    "sitePathPrefixes": ["content", "etc.clientlibs", "experiment", "webui", "auth", "graphql"]
 }

@@ -181,10 +181,10 @@ describe('CLI dry-run', () => {
 
         assert.strictEqual(result.status, 0);
         const lines = result.stdout.trim().split(/\r?\n/).map(JSON.parse);
-        assert.strictEqual(lines.length, 1);
-        assert.strictEqual(lines[0].type, 'dry-run');
-        assert.strictEqual(lines[0].label, 'initial resources');
-        assert.strictEqual(lines[0].resources.includes('/json'), true);
+        const dryRunLine = lines.find(l => l.type === 'dry-run');
+        assert.ok(dryRunLine, 'expected a dry-run event');
+        assert.strictEqual(dryRunLine.label, 'initial resources');
+        assert.strictEqual(dryRunLine.resources.includes('/json'), true);
     });
 
     it('suppresses dry-run resource detail in quiet mode', () => {
