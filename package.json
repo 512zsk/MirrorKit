@@ -1,0 +1,29 @@
+{
+    "name": "mirrorkit",
+    "version": "1.0.0",
+    "description": "Offline Mirror Proxy & Crawler — clones websites for offline access",
+    "private": true,
+    "engines": {
+        "node": ">=18.0.0"
+    },
+    "scripts": {
+        "start": "node server.js --auto-port",
+        "mirror": "node tools/mirror-assets.js",
+        "cms-media": "node tools/mirror-cms-media.js",
+        "validate": "node tools/validate-assets.js",
+        "find-videos": "node tools/find-video-refs.js",
+        "doctor": "node tools/doctor.js",
+        "status": "node tools/status.js",
+        "logs": "node tools/logs.js",
+        "report": "node tools/report.js",
+        "verify-manifest": "node tools/verify-manifest.js",
+        "export-standalone": "node tools/export-standalone.js",
+        "check": "node tools/check.js",
+        "test": "node --test \"tests/*.test.js\""
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/nanke512/MirrorKit"
+    },
+    "license": "AGPL-3.0-or-later"
+}

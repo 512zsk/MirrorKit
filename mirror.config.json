@@ -1,0 +1,16 @@
+{
+    "port": 3000,
+    "autoPort": true,
+    "targetHost": "https://example.com",
+    "mirrorName": "example.com",
+    "startPath": "/",
+    "requestTimeoutMs": 30000,
+    "concurrency": 6,
+    "maxPasses": 4,
+    "downloadRetries": 2,
+    "cmsMediaHost": "https://storage.example.com/example-bucket",
+    "remoteAssetPrefixes": [],
+    "remoteMirrors": [],
+    "ignoredPathPrefixes": [],
+    "sitePathPrefixes": []
+}
