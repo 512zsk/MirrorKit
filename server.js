@@ -3,19 +3,20 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const { promisify } = require('util');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 
 const gzipAsync = promisify(zlib.gzip);
 const deflateAsync = promisify(zlib.deflate);
 const { DEFAULT_ASSET_EXTS, MIME_TYPES } = require('./lib/constants');
 const { isHtmlLike, isValidDownload } = require('./lib/validation');
 const { fetchWithTimeout } = require('./lib/fetch');
+const { fetchWithRetries } = require('./lib/retry-fetch');
 const { ensureDirExists } = require('./lib/files');
 const { argValue, loadMirrorConfig, printConfigProblems, validateMirrorConfig } = require('./lib/config');
 const { safeDecodeURIComponent, safeJoin } = require('./lib/paths');
 const { createFileLogger } = require('./lib/file-logger');
 const { generateLauncher } = require('./lib/generate-launcher');
-const { CookieJar, parseCookies } = require('./lib/cookie-jar');
+const { CookieJar, parseCookies, getSetCookieValues } = require('./lib/cookie-jar');
 
 const serverFileLogger = createFileLogger({
     rootDir: __dirname,
@@ -38,10 +39,12 @@ const CONFIG = loadMirrorConfig(__dirname);
 const STARTED_AT = new Date();
 const PORT = CONFIG.port;
 const AUTO_PORT = CONFIG.autoPort;
+const HOST = CONFIG.host;
 const TARGET_HOST = CONFIG.targetHost;
 const MIRROR_NAME = CONFIG.mirrorName;
 const START_PATH = CONFIG.startPath;
 const REQUEST_TIMEOUT_MS = CONFIG.requestTimeoutMs;
+const MAX_DOWNLOAD_BYTES = CONFIG.maxDownloadBytes;
 
 const REMOTE_MIRRORS = CONFIG.remoteMirrors;
 const BUILTIN_REMOTE_MIRRORS = [];
@@ -66,7 +69,7 @@ function looksLikeMirroredRemoteHost(segment) {
 const REWRITE_TEXT_EXTS = new Set(['.html', '.css']);
 const EXTERNAL_URL_REWRITE_TEXT_EXTS = new Set(['.js', '.mjs', '.json']);
 const REWRITE_ASSET_EXTS = DEFAULT_ASSET_EXTS;
-const ALLOWED_METHODS = 'GET, HEAD, OPTIONS';
+const ALLOWED_METHODS = 'GET, HEAD, POST, OPTIONS';
 
 function isMirrorRequest(reqPath) {
     return reqPath === `/${MIRROR_NAME}` || reqPath.startsWith(`/${MIRROR_NAME}/`);
@@ -197,7 +200,8 @@ function serveFileRange(filePath, req, res, stat, etag) {
     fs.createReadStream(filePath, { start: range.start, end: range.end })
         .on('error', err => {
             if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end(`Error reading file: ${err.code || err.message}`);
+            res.end('Error reading file');
+            logger('error', `Stream error for ${filePath}: ${err.message}`);
         })
         .pipe(res);
 }
@@ -220,7 +224,7 @@ function sendOptions(res) {
         'Allow': ALLOWED_METHODS,
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': ALLOWED_METHODS,
-        'Access-Control-Allow-Headers': 'Content-Type, Range, If-None-Match',
+        'Access-Control-Allow-Headers': 'Content-Type, Range, If-None-Match, Cookie',
         'Access-Control-Max-Age': '86400'
     });
     res.end();
@@ -233,6 +237,11 @@ function sendMethodNotAllowed(req, res) {
         'Access-Control-Allow-Origin': '*'
     });
     res.end(req.method === 'HEAD' ? undefined : `Method not allowed: ${req.method}`);
+}
+
+function isTooLargeResponse(response) {
+    const contentLength = Number(response.headers.get('content-length'));
+    return Number.isFinite(contentLength) && contentLength > MAX_DOWNLOAD_BYTES;
 }
 
 async function serveLocalFile(filePath, req, res) {
@@ -258,7 +267,7 @@ async function serveLocalFile(filePath, req, res) {
         let data = await fs.promises.readFile(filePath);
 
         const ext = path.extname(filePath).toLowerCase();
-        if (REWRITE_TEXT_EXTS.has(ext) || ext === '') {
+        if (REWRITE_TEXT_EXTS.has(ext) || (ext === '' && !data.includes(0))) {
             data = Buffer.from(rewriteTextForLocalMirror(data.toString('utf8')));
         } else if (EXTERNAL_URL_REWRITE_TEXT_EXTS.has(ext)) {
             data = Buffer.from(rewriteExternalUrlsForLocalMirror(data.toString('utf8')));
@@ -275,8 +284,9 @@ async function serveLocalFile(filePath, req, res) {
     } catch (err) {
         if (!res.headersSent) {
             res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end(`Error reading file: ${err.code || err.message}`);
+            res.end('Error reading file');
         }
+        logger('error', `File read error for ${filePath}: ${err.message}`);
     }
 }
 
@@ -297,6 +307,7 @@ function getHealthStatus() {
         startedAt: STARTED_AT.toISOString(),
         uptimeSeconds: Math.floor((Date.now() - STARTED_AT.getTime()) / 1000),
         targetHost: TARGET_HOST,
+        host: HOST,
         port: getBoundPort(),
         configuredPort: PORT,
         autoPort: AUTO_PORT,
@@ -306,6 +317,7 @@ function getHealthStatus() {
         mirrorFolder,
         mirrorFolderExists: fs.existsSync(mirrorFolder),
         requestTimeoutMs: REQUEST_TIMEOUT_MS,
+        maxDownloadBytes: MAX_DOWNLOAD_BYTES,
         logFile: serverFileLogger.logFile
     };
 }
@@ -372,6 +384,21 @@ function rewriteExternalUrlsForLocalMirror(text) {
         .replace(escapedUrl, (match, host, slash) => getLocalUrlPrefixForHost(host, slash));
 }
 
+function rewriteSingleUrl(url) {
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+        const plainUrl = /\bhttps?:\/\/([a-z0-9.-]+\.[a-z]{2,})(\/)/i;
+        const m = url.match(plainUrl);
+        if (m) return url.replace(m[0], getLocalUrlPrefixForHost(m[1], m[2]));
+        return url;
+    }
+    if (url.startsWith('/')) {
+        const mirror = MIRROR_NAME;
+        if (url.startsWith(`/${mirror}/`)) return url;
+        return `/${mirror}${url}`;
+    }
+    return url;
+}
+
 function rewriteTextForLocalMirror(text) {
     const extGroup = REWRITE_ASSET_EXTS.join('|');
     const mirror = escapeRegExp(MIRROR_NAME);
@@ -380,10 +407,24 @@ function rewriteTextForLocalMirror(text) {
     const rootRoute = new RegExp('(["\\\'=])\\/(?!\\/|' + mirror + '\\/)([a-z]{2}(?:-[a-z]{2})?(?:\\/[^"\\\'\\s<)]*)?)', 'gi');
 
     return rewriteExternalUrlsForLocalMirror(text)
-        .replaceAll(TARGET_HOST, `/${MIRROR_NAME}`)
+        .replace(new RegExp(escapeRegExp(TARGET_HOST), 'gi'), `/${MIRROR_NAME}`)
+        // JSON-escaped URLs: https:\/\/host\/path -> /mirrorName/host/path
+        .replace(/https?:\\\/\\\/([a-z0-9.-]+\.[a-z]{2,})(\\\/)/gi,
+            (match, host, slash) => getLocalUrlPrefixForHost(host, '/'))
         .replace(assetUrl, (match, host, assetPath) => `/${MIRROR_NAME}/${host}${assetPath}`)
         .replace(rootAsset, (match, prefix, assetPath) => `${prefix}/${MIRROR_NAME}/${assetPath}`)
-        .replace(rootRoute, (match, prefix, routePath) => `${prefix}/${MIRROR_NAME}/${routePath}`);
+        .replace(rootRoute, (match, prefix, routePath) => `${prefix}/${MIRROR_NAME}/${routePath}`)
+        // Remove <base href> to prevent relative URL resolution against origin
+        .replace(/<base\s+[^>]*href\s*=\s*["'][^"']*["'][^>]*>\s*/gi, '')
+        // iframe, embed, source, object attributes
+        .replace(/((?:iframe|embed|source|object)\s+[^>]*?(?:src|data)\s*=\s*["'])((?:https?:\/\/[^"']+)|(?:\/[^"']+))/gi,
+            (match, attr, url) => `${attr}${rewriteSingleUrl(url)}`)
+        .replace(/((?:data-(?:src|lazy-src|original|bg-src|hi-res-src)|(?:poster|action))\s*=\s*["'])((?:https?:\/\/[^"']+)|(?:\/[^"']+))/gi,
+            (match, attr, url) => `${attr}${rewriteSingleUrl(url)}`)
+        .replace(/((?:data-)?srcset\s*=\s*["'])([^"']+)/gi, (match, attr, values) => {
+            const rewritten = values.replace(/([^,\s]+)\s*(?:[^,]*)/g, (m, url) => m.replace(url, rewriteSingleUrl(url)));
+            return `${attr}${rewritten}`;
+        });
 }
 
 function getRemoteMirror(reqPath) {
@@ -431,7 +472,12 @@ function isAllowedTargetHost(urlString) {
 }
 
 function getTargetUrl(req, reqPath) {
-    const requestUrl = new URL(req.url, `http://localhost:${getBoundPort()}`);
+    let requestUrl;
+    try {
+        requestUrl = new URL(req.url, `http://localhost:${getBoundPort()}`);
+    } catch {
+        return null;
+    }
     const targetPath = isMirrorRequest(reqPath) ? stripMirrorPrefix(reqPath) : reqPath;
     const mirror = getRemoteMirror(targetPath);
 
@@ -452,7 +498,9 @@ function getTargetUrl(req, reqPath) {
     return `${TARGET_HOST}${targetPath}${requestUrl.search}`;
 }
 
-async function proxyAndCache(req, res, localPath, reqPath) {
+const pendingFetches = new Map();
+
+async function proxyAndCache(req, res, localPath, reqPath, postBody) {
     const targetUrl = getTargetUrl(req, reqPath);
     if (!targetUrl) {
         logger('error', `SSRF rejected: ${req.url}`);
@@ -462,50 +510,140 @@ async function proxyAndCache(req, res, localPath, reqPath) {
     }
     logger('cache', `Cache miss: ${req.url} -> ${targetUrl}`);
 
+    // For POST, the body is already buffered — don't abort just because the stream closed
+    if (req.destroyed && !postBody) return;
+
     try {
-        let upstreamCookie;
-        if (CONFIG.forwardCookies && cookieJar) {
-            const browserCookie = req.headers['cookie'] || '';
-            const jarCookie = cookieJar.getCookiesForUrl(targetUrl);
-            if (browserCookie && jarCookie) {
-                const browserNames = new Set(browserCookie.split(';').map(c => c.trim().split('=')[0]));
-                const jarParts = jarCookie.split(';').filter(c => !browserNames.has(c.trim().split('=')[0]));
-                upstreamCookie = [browserCookie, ...jarParts].join('; ');
-            } else {
-                upstreamCookie = browserCookie || jarCookie || undefined;
+        const isUnsafeMethod = req.method !== 'GET' && req.method !== 'HEAD';
+
+        // Only deduplicate safe methods (GET/HEAD) — POST must not share fetches
+        let fetchResult;
+        if (!isUnsafeMethod && pendingFetches.has(targetUrl)) {
+            fetchResult = await pendingFetches.get(targetUrl);
+        } else {
+            const fetchPromise = (async () => {
+                let upstreamCookie;
+                if (CONFIG.forwardCookies && cookieJar) {
+                    const browserCookie = req.headers['cookie'] || '';
+                    const jarCookie = cookieJar.getCookiesForUrl(targetUrl);
+                    if (browserCookie && jarCookie) {
+                        const browserNames = new Set(browserCookie.split(';').map(c => c.trim().split('=')[0]));
+                        const jarParts = jarCookie.split(';').filter(c => !browserNames.has(c.trim().split('=')[0]));
+                        upstreamCookie = [browserCookie, ...jarParts].join('; ');
+                    } else {
+                        upstreamCookie = browserCookie || jarCookie || undefined;
+                    }
+                }
+
+                const fetchOpts = { timeoutMs: REQUEST_TIMEOUT_MS, referer: TARGET_HOST, cookie: upstreamCookie, retries: CONFIG.downloadRetries };
+
+                // Forward POST body and content-type to origin
+                if (isUnsafeMethod) {
+                    fetchOpts.method = req.method;
+                    fetchOpts.headers = {};
+                    if (req.headers['content-type']) fetchOpts.headers['Content-Type'] = req.headers['content-type'];
+                    fetchOpts.body = postBody;
+                    fetchOpts.retries = 0; // Don't retry unsafe methods to avoid duplicate side effects
+                    fetchOpts.redirect = 'manual'; // Preserve 3xx status and intermediate Set-Cookie
+                }
+
+                const response = await fetchWithRetries(targetUrl, fetchOpts);
+
+                const setCookieValues = getSetCookieValues(response);
+
+                // For manual redirects (POST login flows), forward the redirect to the browser
+                if (isUnsafeMethod && response.status >= 300 && response.status < 400) {
+                    return {
+                        ok: true,
+                        status: response.status,
+                        redirect: true,
+                        location: response.headers.get('location'),
+                        setCookieValues
+                    };
+                }
+
+                if (!response.ok) return { ok: false, status: response.status };
+
+                if (isTooLargeResponse(response)) {
+                    return { ok: false, status: 502, reason: 'too large' };
+                }
+
+                const buffer = Buffer.from(await response.arrayBuffer());
+                if (buffer.length > MAX_DOWNLOAD_BYTES) {
+                    return { ok: false, status: 502, reason: 'too large' };
+                }
+
+                return { ok: true, buffer, contentType: response.headers.get('content-type'), setCookieValues };
+            })();
+
+            if (!isUnsafeMethod) {
+                pendingFetches.set(targetUrl, fetchPromise);
+            }
+            try {
+                fetchResult = await fetchPromise;
+            } finally {
+                if (!isUnsafeMethod) {
+                    pendingFetches.delete(targetUrl);
+                }
             }
         }
 
-        const response = await fetchWithTimeout(targetUrl, { timeoutMs: REQUEST_TIMEOUT_MS, referer: TARGET_HOST, acceptEncoding: 'gzip, deflate', cookie: upstreamCookie });
-
-        if (!response.ok) {
-            logger('error', `Origin status ${response.status}: ${req.url}`);
-            res.writeHead(response.status, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end(`Origin responded with status: ${response.status}`);
+        if (!fetchResult.ok) {
+            const msg = fetchResult.reason === 'too large'
+                ? 'Origin response too large to proxy'
+                : `Origin responded with status: ${fetchResult.status}`;
+            logger('error', `${msg}: ${req.url}`);
+            res.writeHead(fetchResult.status, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end(msg);
             return;
         }
 
-        const buffer = Buffer.from(await response.arrayBuffer());
+        const buffer = fetchResult.buffer;
+        const response = { headers: { get: (name) => name === 'content-type' ? fetchResult.contentType : '' } };
+
+        if (CONFIG.forwardCookies && cookieJar && fetchResult.setCookieValues && fetchResult.setCookieValues.length) {
+            for (const headerValue of fetchResult.setCookieValues) {
+                for (const cookie of parseCookies(headerValue, targetUrl)) {
+                    cookieJar.addCookie(cookie);
+                }
+            }
+            cookieJar.saveToFile(COOKIE_JAR_PATH);
+        }
+
+        if (req.destroyed && !postBody) return;
+
+        // POST responses are not cached - just forward them
+        if (req.method === 'POST') {
+            if (fetchResult.redirect) {
+                // Forward redirect status and Location to the browser (login flows)
+                const redirectHeaders = {
+                    'Access-Control-Allow-Origin': '*',
+                    'Location': fetchResult.location || '/'
+                };
+                if (fetchResult.setCookieValues && fetchResult.setCookieValues.length) {
+                    res.setHeader('Set-Cookie', fetchResult.setCookieValues);
+                }
+                res.writeHead(fetchResult.status, redirectHeaders);
+                res.end();
+                return;
+            }
+            const responseHeaders = {
+                'Content-Type': fetchResult.contentType || 'application/octet-stream',
+                'Access-Control-Allow-Origin': '*'
+            };
+            if (fetchResult.setCookieValues && fetchResult.setCookieValues.length) {
+                res.setHeader('Set-Cookie', fetchResult.setCookieValues);
+            }
+            await sendResponse(req, res, 200, responseHeaders, buffer);
+            return;
+        }
+
         if (!isValidDownload(localPath, response, buffer)) {
             const contentType = response.headers.get('content-type') || 'unknown';
             logger('error', `Rejected: ${req.url}`, { contentType });
             res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
-            res.end(`Rejected unexpected content for ${req.url}`);
+            res.end('Rejected unexpected content');
             return;
-        }
-
-        if (CONFIG.forwardCookies && cookieJar) {
-            const setCookieValues = typeof response.headers.getSetCookie === 'function'
-                ? response.headers.getSetCookie()
-                : [];
-            if (setCookieValues.length) {
-                for (const headerValue of setCookieValues) {
-                    for (const cookie of parseCookies(headerValue, targetUrl)) {
-                        cookieJar.addCookie(cookie);
-                    }
-                }
-                cookieJar.saveToFile(COOKIE_JAR_PATH);
-            }
         }
 
         ensureDirExists(localPath);
@@ -523,33 +661,41 @@ async function proxyAndCache(req, res, localPath, reqPath) {
             'Access-Control-Allow-Origin': '*'
         };
 
-        if (CONFIG.forwardCookies) {
-            const setCookieValues = typeof response.headers.getSetCookie === 'function'
-                ? response.headers.getSetCookie()
-                : [];
-            if (setCookieValues.length) {
-                res.setHeader('Set-Cookie', setCookieValues);
-            }
+        if (fetchResult.setCookieValues && fetchResult.setCookieValues.length) {
+            res.setHeader('Set-Cookie', fetchResult.setCookieValues);
         }
 
         await sendResponse(req, res, 200, responseHeaders, buffer);
     } catch (err) {
+        if (res.headersSent) return;
         const status = err.name === 'AbortError' ? 504 : 500;
         logger('error', `${req.url}: ${err.message}`);
         res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end(`Proxy error: ${err.message}`);
+        res.end(status === 504 ? 'Gateway timeout' : 'Proxy error');
     }
 }
 
 const server = http.createServer(async (req, res) => {
+    try {
     if (req.method === 'OPTIONS') {
         sendOptions(res);
         return;
     }
 
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'POST') {
         sendMethodNotAllowed(req, res);
         return;
+    }
+
+    // Collect POST body eagerly before any async work can destroy the stream
+    let postBody = undefined;
+    if (req.method === 'POST') {
+        postBody = await new Promise((resolve, reject) => {
+            const chunks = [];
+            req.on('data', c => chunks.push(c));
+            req.on('end', () => resolve(chunks.length > 0 ? Buffer.concat(chunks) : undefined));
+            req.on('error', reject);
+        });
     }
 
     if (req.url === '/favicon.ico') {
@@ -612,6 +758,12 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // POST requests always proxy to origin (for login flows, etc.)
+    if (req.method === 'POST') {
+        await proxyAndCache(req, res, localPath, reqPath, postBody);
+        return;
+    }
+
     try {
         const stat = await fs.promises.stat(localPath);
         if (stat.isFile()) {
@@ -623,20 +775,37 @@ const server = http.createServer(async (req, res) => {
     }
 
     await proxyAndCache(req, res, localPath, reqPath);
+    } catch (err) {
+        if (!res.headersSent) {
+            const status = err.name === 'AbortError' ? 504 : 500;
+            res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Internal server error');
+        }
+        logger('error', `Unhandled error for ${req.url}: ${err.message}`);
+    }
 });
 
-function printStartupInfo(port = getBoundPort()) {
+server.timeout = 120000;
+server.headersTimeout = 30000;
+server.keepAliveTimeout = 5000;
+
+function printStartupInfo(port = getBoundPort(), host = HOST) {
+    const displayHost = host === '127.0.0.1' ? 'localhost' : host;
     console.log('\n==========================================================');
     console.log('\x1b[36m  Offline Mirror - Local Proxy & Crawler Server\x1b[0m');
     console.log('==========================================================');
     console.log(`Target host: \x1b[32m${TARGET_HOST}\x1b[0m`);
     console.log(`Mirror folder: \x1b[32m${MIRROR_NAME}\x1b[0m`);
-    console.log(`Local starter: \x1b[32mhttp://localhost:${port}/\x1b[0m`);
-    console.log(`Mirror entry: \x1b[32mhttp://localhost:${port}${getMirrorEntryPath()}\x1b[0m`);
+    console.log(`Bind address: \x1b[32m${host}\x1b[0m`);
+    console.log(`Local starter: \x1b[32mhttp://${displayHost}:${port}/\x1b[0m`);
+    console.log(`Mirror entry: \x1b[32mhttp://${displayHost}:${port}${getMirrorEntryPath()}\x1b[0m`);
     console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms`);
+    console.log(`Max download size: ${MAX_DOWNLOAD_BYTES} bytes`);
     console.log(`Log file: ${serverFileLogger.logFile || 'disabled'}`);
     if (CONFIG.forwardCookies) {
-        console.log(`Cookie forwarding: \x1b[32menabled\x1b[0m (jar: ${COOKIE_JAR_PATH})`);
+        console.log(`Cookie forwarding: \x1b[32menabled\x1b[0m`);
+        console.log(`  Cookie jar: ${COOKIE_JAR_PATH}`);
+        console.log('  \x1b[33mPlease log in through the browser first, then run mirror-assets.js\x1b[0m');
     }
     console.log('Unexpected HTML fallback responses will not be cached as assets.');
     console.log('----------------------------------------------------------\n');
@@ -647,12 +816,20 @@ function shouldOpenBrowser() {
 }
 
 function openBrowser(port = getBoundPort()) {
+    if (!Number.isInteger(port) || port < 0 || port > 65535) return;
     if (!process.argv.includes('--no-open') && process.env.NO_OPEN !== '1') {
-        const url = `http://localhost:${port}/`;
+        const displayHost = HOST === '127.0.0.1' ? 'localhost' : HOST;
+        const url = `http://${displayHost}:${port}/`;
         const startCmd = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open';
-        exec(`${startCmd} ${url}`, (err) => {
-            if (err) logger('warn', 'Failed to auto-open browser', { error: err.message });
-        });
+        if (process.platform === 'win32') {
+            execFile('cmd', ['/c', 'start', url], (err) => {
+                if (err) logger('warn', 'Failed to auto-open browser', { error: err.message });
+            });
+        } else {
+            execFile(startCmd, [url], (err) => {
+                if (err) logger('warn', 'Failed to auto-open browser', { error: err.message });
+            });
+        }
     }
 }
 
@@ -701,6 +878,7 @@ function startServer() {
         const onListening = () => {
             server.off('error', onError);
             const actualPort = getBoundPort();
+            try { fs.writeFileSync(path.join(__dirname, '.port'), String(actualPort)); } catch {}
             printStartupInfo(actualPort);
             if (shouldOpenBrowser()) openBrowser(actualPort);
         };
@@ -720,7 +898,7 @@ function startServer() {
 
         server.once('error', onError);
         server.once('listening', onListening);
-        server.listen(port);
+        server.listen(port, HOST);
     }
 
     listenOn(PORT);
@@ -732,11 +910,14 @@ function printHelp() {
     console.log(`MirrorKit local proxy server
 
 Usage:
-  node server.js [--config <file>] [--port <number>] [--auto-port] [--no-open] [--log-file <file>]
+  node server.js [--config <file>] [--port <number>] [--host <address>] [--auto-port] [--no-open] [--log-file <file>]
 
 Options:
   --config <file> Use a config file other than mirror.config.json.
   --port <number> Override the configured local server port.
+  --host <address>
+                  Bind to this address. Default: 127.0.0.1 (localhost only).
+                  Use 0.0.0.0 to listen on all network interfaces.
   --auto-port     If the port is busy, try the next available port.
   --no-open       Start the server without opening a browser.
   --log-file <file>
@@ -745,9 +926,9 @@ Options:
 
 Configuration:
   Edit mirror.config.json, pass --config <file>, or override with PORT,
-  TARGET_HOST, MIRROR_NAME, START_PATH, PROXY_TIMEOUT_MS,
-  MIRRORKIT_AUTO_PORT=1, MIRRORKIT_LOG_DIR, MIRRORKIT_LOG_FILE,
-  MIRRORKIT_LOG_FILE=0, and NO_OPEN=1.
+  MIRRORKIT_HOST, TARGET_HOST, MIRROR_NAME, START_PATH, PROXY_TIMEOUT_MS,
+  MIRROR_MAX_DOWNLOAD_BYTES, MIRRORKIT_AUTO_PORT=1, MIRRORKIT_LOG_DIR,
+  MIRRORKIT_LOG_FILE, MIRRORKIT_LOG_FILE=0, and NO_OPEN=1.
 `);
 }
 
@@ -774,6 +955,9 @@ if (require.main === module) {
         startServer();
         process.on('SIGINT', () => shutdown('SIGINT'));
         process.on('SIGTERM', () => shutdown('SIGTERM'));
+        process.on('unhandledRejection', (reason) => {
+            logger('error', `Unhandled rejection: ${reason && reason.stack || reason}`);
+        });
     }
 }
 

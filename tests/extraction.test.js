@@ -91,6 +91,23 @@ describe('normalizeAssetPath', () => {
         assert.strictEqual(normalizeAssetPath('Loading target-vec.js', ASSET_EXTS), null);
         assert.strictEqual(normalizeAssetPath('Failed to fetch app.js', ASSET_EXTS), null);
     });
+
+    it('resolves ./ relative to source path', () => {
+        assert.strictEqual(normalizeAssetPath('./image.png', ASSET_EXTS, '/path/to/page.html'), 'path/to/image.png');
+    });
+
+    it('resolves ../ relative to source path', () => {
+        assert.strictEqual(normalizeAssetPath('../img/photo.jpg', ASSET_EXTS, '/css/pages/style.css'), 'css/img/photo.jpg');
+    });
+
+    it('rejects relative paths without sourcePath', () => {
+        assert.strictEqual(normalizeAssetPath('./image.png', ASSET_EXTS), null);
+        assert.strictEqual(normalizeAssetPath('../img/photo.jpg', ASSET_EXTS), null);
+    });
+
+    it('resolves ./ in subdirectory context', () => {
+        assert.strictEqual(normalizeAssetPath('./lib.js', ASSET_EXTS, '/js/app.js'), 'js/lib.js');
+    });
 });
 
 describe('extractAssetPathsFromText', () => {
@@ -134,6 +151,13 @@ describe('extractAssetPathsFromText', () => {
     it('returns empty set for text without assets', () => {
         const result = extractAssetPathsFromText('hello world', { assetExts: ASSET_EXTS });
         assert.strictEqual(result.size, 0);
+    });
+
+    it('resolves relative paths when sourcePath is provided', () => {
+        const html = '<script src="./lib.js"></script><img src="../img/logo.png">';
+        const result = extractAssetPathsFromText(html, { assetExts: ASSET_EXTS, sourcePath: '/js/app.js' });
+        assert.strictEqual(result.has('js/lib.js'), true);
+        assert.strictEqual(result.has('img/logo.png'), true);
     });
 });
 

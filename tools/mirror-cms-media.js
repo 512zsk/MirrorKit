@@ -13,6 +13,7 @@ const { createFileLogger } = require('../lib/file-logger');
 const { runMirrorWorkflow } = require('../lib/mirror-runner');
 const { createFileInventory, createMirrorManifest, writeMirrorManifest } = require('../lib/manifest');
 const { generateLauncher } = require('../lib/generate-launcher');
+const { CookieJar, parseCookies, getSetCookieValues } = require('../lib/cookie-jar');
 
 const ROOT = path.resolve(__dirname, '..');
 const CONFIG = loadMirrorConfig(ROOT);
@@ -23,6 +24,7 @@ const MIRROR_NAME = CONFIG.mirrorName;
 const CMS_HOST = CONFIG.cmsMediaHost;
 
 const TIMEOUT_MS = CONFIG.requestTimeoutMs;
+const MAX_DOWNLOAD_BYTES = CONFIG.maxDownloadBytes;
 const CONCURRENCY = CONFIG.concurrency;
 const MAX_PASSES = CONFIG.maxPasses;
 const DOWNLOAD_RETRIES = CONFIG.downloadRetries;
@@ -56,6 +58,23 @@ const fileLogger = createFileLogger({
 const logger = createCliLogger({ quiet: SHOULD_QUIET, json: SHOULD_JSON_LOG, fileLogger });
 const LOG_FILE_LABEL = fileLogger.logFile ? path.relative(ROOT, fileLogger.logFile) : 'disabled';
 
+const COOKIE_JAR_PATH = path.join(ROOT, MIRROR_NAME, '.cookies.json');
+let cookieHeader = '';
+let cookieJar = null;
+if (CONFIG.forwardCookies) {
+    fileLogger.clear();
+    cookieJar = new CookieJar();
+    cookieJar.loadFromFile(COOKIE_JAR_PATH);
+    cookieHeader = cookieJar.getCookiesForUrl(TARGET_HOST);
+    if (cookieHeader) {
+        logger.status(`Cookie forwarding enabled — loaded cookies from ${COOKIE_JAR_PATH}`);
+        logger.status(`Crawler will use your login session. Cookies refresh automatically each pass.`);
+    } else {
+        logger.status(`Cookie forwarding enabled but no cookies found.`);
+        logger.status(`Please start the server first (node server.js), log in through the browser, then re-run this tool.`);
+    }
+}
+
 if (args.has('--help') || args.has('-h')) {
     console.log(`MirrorKit CMS media downloader
 
@@ -77,7 +96,8 @@ Options:
 Configuration:
   Edit mirror.config.json, pass --config <file>, or override with TARGET_HOST,
   MIRROR_NAME, CMS_MEDIA_HOST, MIRROR_TIMEOUT_MS, MIRROR_CONCURRENCY,
-  MIRROR_MAX_PASSES, MIRROR_RETRIES, MIRRORKIT_LOG_DIR, and MIRRORKIT_LOG_FILE.
+  MIRROR_MAX_PASSES, MIRROR_RETRIES, MIRROR_MAX_DOWNLOAD_BYTES,
+  MIRRORKIT_LOG_DIR, and MIRRORKIT_LOG_FILE.
 `);
     process.exit(0);
 }
@@ -92,7 +112,12 @@ function saveProgress(pass, pending, seen, stats) {
             pass, pending: [...pending], seen: [...seen], stats,
             savedAt: new Date().toISOString()
         }));
-        fs.renameSync(tmp, PROGRESS_FILE);
+        try {
+            fs.renameSync(tmp, PROGRESS_FILE);
+        } catch {
+            fs.copyFileSync(tmp, PROGRESS_FILE);
+            try { fs.unlinkSync(tmp); } catch {}
+        }
     } catch { /* 保存进度失败不阻塞主流程 */ }
 }
 
@@ -111,6 +136,19 @@ process.on('SIGINT', () => {
     } else {
         process.exit(1);
     }
+});
+
+process.on('SIGTERM', () => {
+    if (!shouldStop) {
+        shouldStop = true;
+        logger.status('\nReceived SIGTERM, stopping after current batch...');
+    } else {
+        process.exit(1);
+    }
+});
+
+process.on('unhandledRejection', (reason) => {
+    logger.error(`Unhandled rejection: ${reason && reason.stack || reason}`);
 });
 
 function mirrorRoot() {
@@ -167,6 +205,11 @@ function localPathForAsset(assetPath) {
 
 function remoteUrlForAsset(assetPath) {
     return resolveRemoteUrlForAsset(assetPath, TARGET_HOST);
+}
+
+function responseTooLarge(response) {
+    const contentLength = Number(response.headers.get('content-length'));
+    return Number.isFinite(contentLength) && contentLength > MAX_DOWNLOAD_BYTES;
 }
 
 function collectLocalSources() {
@@ -253,13 +296,33 @@ async function downloadAsset(assetPath) {
     const response = await fetchWithRetries(url, {
         timeoutMs: TIMEOUT_MS,
         referer: TARGET_HOST,
-        retries: DOWNLOAD_RETRIES
+        retries: DOWNLOAD_RETRIES,
+        cookie: cookieHeader || undefined
     });
+
+    if (cookieJar) {
+        const setCookieValues = getSetCookieValues(response);
+        for (const headerValue of setCookieValues) {
+            for (const cookie of parseCookies(headerValue, url)) {
+                cookieJar.addCookie(cookie);
+            }
+        }
+        if (setCookieValues.length) cookieHeader = cookieJar.getCookiesForUrl(TARGET_HOST);
+    }
+
     if (!response.ok) {
         return { status: 'fail', assetPath, message: `HTTP ${response.status}` };
     }
 
+    if (responseTooLarge(response)) {
+        return { status: 'reject', assetPath, message: `too large: exceeds ${MAX_DOWNLOAD_BYTES} bytes` };
+    }
+
     const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > MAX_DOWNLOAD_BYTES) {
+        return { status: 'reject', assetPath, message: `too large: exceeds ${MAX_DOWNLOAD_BYTES} bytes` };
+    }
+
     if (!isValidDownload(localPath, response, buffer, { strictTextHtmlFallback: true })) {
         return { status: 'reject', assetPath, message: response.headers.get('content-type') || 'unknown content-type' };
     }
@@ -345,6 +408,10 @@ async function main() {
         maxPasses: MAX_PASSES,
         mirrorFolder: mirrorRoot(),
         passLabel: pass => `CMS media pass ${pass}`,
+        onPassStart: cookieJar ? () => {
+            cookieJar.loadFromFile(COOKIE_JAR_PATH);
+            cookieHeader = cookieJar.getCookiesForUrl(TARGET_HOST);
+        } : undefined,
         saveProgress,
         clearProgress: () => {
             try { fs.unlinkSync(PROGRESS_FILE); } catch {}

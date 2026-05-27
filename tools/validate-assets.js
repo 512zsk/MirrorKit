@@ -29,6 +29,16 @@ function validateFile(filePath) {
 }
 
 function main() {
+    if (CONFIG.configFileError) {
+        console.error(`Config error: ${CONFIG.configFileError}`);
+        process.exitCode = 1;
+        return;
+    }
+    if (CONFIG.configFileMissing) {
+        console.error(`Config file not found: ${CONFIG.configPath}`);
+        process.exitCode = 1;
+        return;
+    }
     const problems = validateMirrorConfig(CONFIG);
     if (problems.length) {
         printConfigProblems(problems);

@@ -161,7 +161,8 @@ node tools\mirror-assets.js --config sites/site-a.json
     "autoPort": true,
     "targetHost": "https://example.com",
     "mirrorName": "example.com",
-    "startPath": "/"
+    "startPath": "/",
+    "maxDownloadBytes": 268435456
 }
 ```
 
@@ -264,7 +265,27 @@ http://localhost:3000/xxx.com/zh
 
 建议保持开启，尤其是双击启动或给非技术用户使用时。
 
-### 5. FORWARD_COOKIES
+### 5. MAX_DOWNLOAD_BYTES
+
+单个远程资源允许缓存的最大字节数。
+
+```json
+{
+    "maxDownloadBytes": 268435456
+}
+```
+
+默认是 256 MB。超过这个大小的资源会被拒绝缓存，服务器和下载工具都会跳过它。
+
+MirrorKit 的目标是本地研究网页结构、样式、脚本和必要展示资源，不是批量搬运第三方大视频或完整媒体库。如果某个站点依赖超大视频文件，建议只保留页面样式和交互结构，不把超大媒体作为必须离线保存的内容。
+
+也可以用环境变量临时调整：
+
+```bat
+set MIRROR_MAX_DOWNLOAD_BYTES=104857600
+```
+
+### 6. FORWARD_COOKIES
 
 需要登录才能访问的网站，开启 Cookie 转发。
 
@@ -389,6 +410,7 @@ node tools\status.js --json
 下载成功后保存本地
 把页面里的外链改成本地镜像路径
 支持本地视频和大文件的 Range 分段读取
+超过 maxDownloadBytes 的远程资源不会被缓存
 ```
 
 运行：
@@ -513,6 +535,8 @@ JSON
 wasm
 压缩纹理
 ```
+
+注意：下载工具会遵守 `maxDownloadBytes`。超过限制的资源会被标记为 reject，不会写入本地镜像。
 
 运行：
 

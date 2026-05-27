@@ -35,6 +35,7 @@ describe('loadMirrorConfig', () => {
             targetHost: 'https://site.test',
             mirrorName: 'site.test',
             maxPasses: 8,
+            maxDownloadBytes: 1024,
             remoteAssetPrefixes: ['https://cdn.test/'],
             sitePathPrefixes: ['content']
         }));
@@ -43,6 +44,7 @@ describe('loadMirrorConfig', () => {
         assert.strictEqual(config.targetHost, 'https://site.test');
         assert.strictEqual(config.mirrorName, 'site.test');
         assert.strictEqual(config.maxPasses, 8);
+        assert.strictEqual(config.maxDownloadBytes, 1024);
         assert.deepStrictEqual(config.remoteAssetPrefixes, ['https://cdn.test/']);
         assert.deepStrictEqual(config.sitePathPrefixes, ['content']);
     });
@@ -161,6 +163,33 @@ describe('validateMirrorConfig', () => {
         const problems = validateMirrorConfig(config);
         assert.strictEqual(problems.some(problem => problem.includes('prefix')), true);
         assert.strictEqual(problems.some(problem => problem.includes('origin')), true);
+    });
+
+    it('reports invalid max download size', () => {
+        const config = loadMirrorConfig(tmpDir, {});
+        config.maxDownloadBytes = 0;
+
+        const problems = validateMirrorConfig(config);
+        assert.strictEqual(problems.some(problem => problem.includes('maxDownloadBytes')), true);
+    });
+
+    it('accepts valid host values', () => {
+        const config = loadMirrorConfig(tmpDir, {});
+        config.host = '127.0.0.1';
+        assert.deepStrictEqual(validateMirrorConfig(config), []);
+
+        config.host = '0.0.0.0';
+        assert.deepStrictEqual(validateMirrorConfig(config), []);
+
+        config.host = 'localhost';
+        assert.deepStrictEqual(validateMirrorConfig(config), []);
+    });
+
+    it('rejects invalid host values', () => {
+        const config = loadMirrorConfig(tmpDir, {});
+        config.host = 'not.a.valid.host';
+        const problems = validateMirrorConfig(config);
+        assert.strictEqual(problems.some(problem => problem.includes('host')), true);
     });
 
     it('reports missing explicit config files and invalid JSON', () => {

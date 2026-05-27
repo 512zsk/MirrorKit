@@ -12,7 +12,7 @@ const { createFileLogger } = require('../lib/file-logger');
 const { runMirrorWorkflow } = require('../lib/mirror-runner');
 const { createFileInventory, createMirrorManifest, writeMirrorManifest } = require('../lib/manifest');
 const { generateLauncher } = require('../lib/generate-launcher');
-const { CookieJar } = require('../lib/cookie-jar');
+const { CookieJar, parseCookies, getSetCookieValues } = require('../lib/cookie-jar');
 
 const ROOT = path.resolve(__dirname, '..');
 const CONFIG = loadMirrorConfig(ROOT);
@@ -22,6 +22,7 @@ const TARGET_HOST = CONFIG.targetHost;
 const MIRROR_NAME = CONFIG.mirrorName;
 const START_PATH = CONFIG.startPath;
 const TIMEOUT_MS = CONFIG.requestTimeoutMs;
+const MAX_DOWNLOAD_BYTES = CONFIG.maxDownloadBytes;
 const CONCURRENCY = CONFIG.concurrency;
 const MAX_PASSES = CONFIG.maxPasses;
 const DOWNLOAD_RETRIES = CONFIG.downloadRetries;
@@ -44,6 +45,7 @@ const SHOULD_RESUME = args.has('--resume');
 const SHOULD_DRY_RUN = args.has('--dry-run');
 const SHOULD_QUIET = args.has('--quiet');
 const SHOULD_JSON_LOG = args.has('--json-log') || args.has('--json');
+const ALLOW_EXTERNAL = CONFIG.allowExternalAssets;
 const fileLogger = createFileLogger({
     rootDir: ROOT,
     filename: 'mirrorkit-tools.log',
@@ -54,15 +56,18 @@ const LOG_FILE_LABEL = fileLogger.logFile ? path.relative(ROOT, fileLogger.logFi
 
 const COOKIE_JAR_PATH = path.join(ROOT, MIRROR_NAME, '.cookies.json');
 let cookieHeader = '';
+let cookieJar = null;
 if (CONFIG.forwardCookies) {
     fileLogger.clear();
-    const jar = new CookieJar();
-    jar.loadFromFile(COOKIE_JAR_PATH);
-    cookieHeader = jar.getCookiesForUrl(TARGET_HOST);
+    cookieJar = new CookieJar();
+    cookieJar.loadFromFile(COOKIE_JAR_PATH);
+    cookieHeader = cookieJar.getCookiesForUrl(TARGET_HOST);
     if (cookieHeader) {
-        logger.status(`Loaded cookies from ${COOKIE_JAR_PATH}`);
+        logger.status(`Cookie forwarding enabled — loaded cookies from ${COOKIE_JAR_PATH}`);
+        logger.status(`Crawler will use your login session. Cookies refresh automatically each pass.`);
     } else {
-        logger.status(`Cookie forwarding enabled but no cookies found in jar.`);
+        logger.status(`Cookie forwarding enabled but no cookies found.`);
+        logger.status(`Please start the server first (node server.js), log in through the browser, then re-run this tool.`);
     }
 }
 
@@ -87,7 +92,8 @@ Options:
 Configuration:
   Edit mirror.config.json, pass --config <file>, or override with TARGET_HOST,
   MIRROR_NAME, START_PATH, MIRROR_TIMEOUT_MS, MIRROR_CONCURRENCY,
-  MIRROR_MAX_PASSES, MIRROR_RETRIES, MIRRORKIT_LOG_DIR, and MIRRORKIT_LOG_FILE.
+  MIRROR_MAX_PASSES, MIRROR_RETRIES, MIRROR_MAX_DOWNLOAD_BYTES,
+  MIRRORKIT_LOG_DIR, and MIRRORKIT_LOG_FILE.
 `);
     process.exit(0);
 }
@@ -102,7 +108,12 @@ function saveProgress(pass, pending, seen, stats) {
             pass, pending: [...pending], seen: [...seen], stats,
             savedAt: new Date().toISOString()
         }));
-        fs.renameSync(tmp, PROGRESS_FILE);
+        try {
+            fs.renameSync(tmp, PROGRESS_FILE);
+        } catch {
+            fs.copyFileSync(tmp, PROGRESS_FILE);
+            try { fs.unlinkSync(tmp); } catch {}
+        }
     } catch { /* 保存进度失败不阻塞主流程 */ }
 }
 
@@ -123,8 +134,53 @@ process.on('SIGINT', () => {
     }
 });
 
+process.on('SIGTERM', () => {
+    if (!shouldStop) {
+        shouldStop = true;
+        logger.status('\nReceived SIGTERM, stopping after current batch...');
+    } else {
+        process.exit(1);
+    }
+});
+
+process.on('unhandledRejection', (reason) => {
+    logger.error(`Unhandled rejection: ${reason && reason.stack || reason}`);
+});
+
 function getActiveRemoteAssetPrefixes() {
     return new Set([...REMOTE_ASSET_PREFIXES, ...BUILTIN_REMOTE_ASSET_PREFIXES]);
+}
+
+function isAllowedExternalUrl(url) {
+    if (typeof url !== 'string' || !url.startsWith('http')) return true;
+    // Check if URL matches the target host
+    try {
+        const parsed = new URL(url);
+        const targetParsed = new URL(TARGET_HOST);
+        if (parsed.hostname === targetParsed.hostname) return true;
+    } catch { return true; }
+    // Check if URL matches any configured remote asset prefix
+    for (const prefix of getActiveRemoteAssetPrefixes()) {
+        if (url.startsWith(prefix)) return true;
+    }
+    return false;
+}
+
+function filterExternalAssets(assets) {
+    if (ALLOW_EXTERNAL) return assets;
+    const filtered = new Set();
+    let blocked = 0;
+    for (const asset of assets) {
+        if (isAllowedExternalUrl(asset)) {
+            filtered.add(asset);
+        } else {
+            blocked++;
+        }
+    }
+    if (blocked > 0) {
+        logger.warn(`Blocked ${blocked} external asset(s) not in allowed prefixes. Set allowExternalAssets: true to permit.`);
+    }
+    return filtered;
 }
 
 function localPathForAsset(assetPath) {
@@ -138,6 +194,11 @@ function localPathForAsset(assetPath) {
 
 function remoteUrlForAsset(assetPath) {
     return resolveRemoteUrlForAsset(assetPath, TARGET_HOST);
+}
+
+function responseTooLarge(response) {
+    const contentLength = Number(response.headers.get('content-length'));
+    return Number.isFinite(contentLength) && contentLength > MAX_DOWNLOAD_BYTES;
 }
 
 function collectLocalSources() {
@@ -172,9 +233,12 @@ function collectBadCachedAssets() {
 
 function collectInitialAssets() {
     const assets = new Set(SEED_URLS);
-    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [...getActiveRemoteAssetPrefixes()] };
+    const mirrorRoot = path.join(ROOT, MIRROR_NAME);
+    const baseExtractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [...getActiveRemoteAssetPrefixes()] };
 
     for (const filePath of collectLocalSources()) {
+        const relPath = '/' + path.relative(mirrorRoot, filePath).replace(/\\/g, '/');
+        const extractOpts = { ...baseExtractOpts, sourcePath: relPath };
         const text = readTextIfExists(filePath);
         for (const item of extractAssetPathsFromText(text, extractOpts)) assets.add(item);
 
@@ -192,7 +256,7 @@ function collectInitialAssets() {
         for (const item of collectBadCachedAssets()) assets.add(item);
     }
 
-    return assets;
+    return filterExternalAssets(assets);
 }
 
 async function downloadAsset(assetPath) {
@@ -201,6 +265,10 @@ async function downloadAsset(assetPath) {
         return { status: 'reject', assetPath, message: 'unsafe local path' };
     }
     const url = remoteUrlForAsset(assetPath);
+
+    if (!ALLOW_EXTERNAL && !isAllowedExternalUrl(url)) {
+        return { status: 'reject', assetPath, message: 'external asset not allowed' };
+    }
 
     if (fs.existsSync(localPath) && !SHOULD_RETRY_BAD) {
         return { status: 'skip', assetPath };
@@ -212,11 +280,30 @@ async function downloadAsset(assetPath) {
         retries: DOWNLOAD_RETRIES,
         cookie: cookieHeader || undefined
     });
+
+    if (cookieJar) {
+        const setCookieValues = getSetCookieValues(response);
+        for (const headerValue of setCookieValues) {
+            for (const cookie of parseCookies(headerValue, url)) {
+                cookieJar.addCookie(cookie);
+            }
+        }
+        if (setCookieValues.length) cookieHeader = cookieJar.getCookiesForUrl(TARGET_HOST);
+    }
+
     if (!response.ok) {
         return { status: 'fail', assetPath, message: `HTTP ${response.status}` };
     }
 
+    if (responseTooLarge(response)) {
+        return { status: 'reject', assetPath, message: `too large: exceeds ${MAX_DOWNLOAD_BYTES} bytes` };
+    }
+
     const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length > MAX_DOWNLOAD_BYTES) {
+        return { status: 'reject', assetPath, message: `too large: exceeds ${MAX_DOWNLOAD_BYTES} bytes` };
+    }
+
     if (!isValidDownload(localPath, response, buffer)) {
         return { status: 'reject', assetPath, message: response.headers.get('content-type') || 'unknown content-type' };
     }
@@ -293,13 +380,17 @@ async function main() {
     const result = await runMirrorWorkflow({
         collectInitialAssets,
         concurrency: CONCURRENCY,
-        discoverAssets: item => discoverAssetsFromDownloadedItem(item, extractOpts),
+        discoverAssets: item => discoverAssetsFromDownloadedItem(item, { ...extractOpts, sourcePath: item }),
         downloadAsset,
         dryRunLabel: 'initial resources',
         logger,
         loadProgress,
         maxPasses: MAX_PASSES,
         mirrorFolder: path.join(ROOT, MIRROR_NAME),
+        onPassStart: cookieJar ? () => {
+            cookieJar.loadFromFile(COOKIE_JAR_PATH);
+            cookieHeader = cookieJar.getCookiesForUrl(TARGET_HOST);
+        } : undefined,
         saveProgress,
         clearProgress: () => {
             try { fs.unlinkSync(PROGRESS_FILE); } catch {}

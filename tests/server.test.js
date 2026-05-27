@@ -58,6 +58,7 @@ describe('server integration', () => {
             START_PATH: process.env.START_PATH,
             PORT: process.env.PORT,
             MIRRORKIT_AUTO_PORT: process.env.MIRRORKIT_AUTO_PORT,
+            MIRROR_MAX_DOWNLOAD_BYTES: process.env.MIRROR_MAX_DOWNLOAD_BYTES,
             MIRRORKIT_LOG_DIR: process.env.MIRRORKIT_LOG_DIR,
             MIRRORKIT_LOG_FILE: process.env.MIRRORKIT_LOG_FILE,
             NO_LOG_FILE: process.env.NO_LOG_FILE,
@@ -65,20 +66,41 @@ describe('server integration', () => {
         };
 
         origin = http.createServer((req, res) => {
-            if (req.url === '/assets/app.js') {
-                res.writeHead(200, { 'Content-Type': 'application/javascript' });
-                res.end('window.cached = true;');
-                return;
-            }
+            const respond = () => {
+                if (req.url === '/assets/app.js') {
+                    res.writeHead(200, { 'Content-Type': 'application/javascript' });
+                    res.end('window.cached = true;');
+                    return;
+                }
 
-            if (req.url === '/bad.png') {
-                res.writeHead(200, { 'Content-Type': 'text/html' });
-                res.end('<!doctype html><html><title>not found</title></html>');
-                return;
-            }
+                if (req.url === '/bad.png') {
+                    res.writeHead(200, { 'Content-Type': 'text/html' });
+                    res.end('<!doctype html><html><title>not found</title></html>');
+                    return;
+                }
 
-            res.writeHead(404, { 'Content-Type': 'text/plain' });
-            res.end('missing');
+                if (req.url === '/large.bin') {
+                    const body = Buffer.alloc(32, 'x');
+                    res.writeHead(200, {
+                        'Content-Type': 'application/octet-stream',
+                        'Content-Length': String(body.length)
+                    });
+                    res.end(body);
+                    return;
+                }
+
+                res.writeHead(404, { 'Content-Type': 'text/plain' });
+                res.end('missing');
+            };
+
+            // Consume request body for POST/PUT before responding
+            if (req.method === 'POST' || req.method === 'PUT') {
+                const chunks = [];
+                req.on('data', c => chunks.push(c));
+                req.on('end', respond);
+            } else {
+                respond();
+            }
         });
         originPort = await listen(origin);
 
@@ -169,18 +191,143 @@ describe('server integration', () => {
         const response = await fetch(`http://127.0.0.1:${port}/${mirrorName}/assets/app.js`, { method: 'OPTIONS' });
 
         assert.strictEqual(response.status, 204);
-        assert.strictEqual(response.headers.get('allow'), 'GET, HEAD, OPTIONS');
-        assert.strictEqual(response.headers.get('access-control-allow-methods'), 'GET, HEAD, OPTIONS');
+        assert.strictEqual(response.headers.get('allow'), 'GET, HEAD, POST, OPTIONS');
+        assert.strictEqual(response.headers.get('access-control-allow-methods'), 'GET, HEAD, POST, OPTIONS');
         assert.strictEqual(fs.existsSync(path.join(mirrorDir, 'assets', 'app.js')), false);
+    });
+
+    it('proxies POST requests to origin without caching', async () => {
+        const port = await listen(mirrorServerModule.server);
+        const response = await fetch(`http://127.0.0.1:${port}/${mirrorName}/assets/app.js`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{"test":true}'
+        });
+
+        assert.strictEqual(response.status, 200);
+        assert.strictEqual(await response.text(), 'window.cached = true;');
+        // POST responses should not be cached to disk
+        assert.strictEqual(fs.existsSync(path.join(mirrorDir, 'assets', 'app.js')), false);
+    });
+
+    it('forwards POST redirect with Set-Cookie to the browser', async () => {
+        const loginOrigin = http.createServer((req, res) => {
+            const chunks = [];
+            req.on('data', c => chunks.push(c));
+            req.on('end', () => {
+                if (req.url === '/login' && req.method === 'POST') {
+                    res.writeHead(302, {
+                        'Location': '/dashboard',
+                        'Set-Cookie': 'session=abc123; Path=/'
+                    });
+                    res.end();
+                } else if (req.url === '/dashboard') {
+                    res.writeHead(200, { 'Content-Type': 'text/html' });
+                    res.end('<h1>Welcome</h1>');
+                } else {
+                    res.writeHead(404);
+                    res.end();
+                }
+            });
+        });
+        const loginPort = await listen(loginOrigin);
+
+        const loginMirror = `.tmp-login-mirror-${process.pid}-${Date.now()}`;
+        const loginDir = path.join(ROOT, loginMirror);
+        fs.rmSync(loginDir, { recursive: true, force: true });
+
+        const serverPath = require.resolve('../server');
+        delete require.cache[serverPath];
+        const loginModule = loadServerWithEnv({
+            TARGET_HOST: `http://127.0.0.1:${loginPort}`,
+            MIRROR_NAME: loginMirror,
+            START_PATH: '/',
+            NO_OPEN: '1'
+        });
+
+        try {
+            const port = await listen(loginModule.server);
+            const response = await fetch(`http://127.0.0.1:${port}/${loginMirror}/login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'user=test&pass=test',
+                redirect: 'manual'
+            });
+
+            assert.strictEqual(response.status, 302);
+            assert.strictEqual(response.headers.get('location'), '/dashboard');
+            assert.match(response.headers.get('set-cookie'), /session=abc123/);
+        } finally {
+            await close(loginModule.server);
+            await close(loginOrigin);
+            fs.rmSync(loginDir, { recursive: true, force: true });
+            delete require.cache[serverPath];
+        }
+    });
+
+    it('does not deduplicate concurrent POST requests to the same path', async () => {
+        const bodies = [];
+        const postOrigin = http.createServer((req, res) => {
+            const chunks = [];
+            req.on('data', c => chunks.push(c));
+            req.on('end', () => {
+                const body = Buffer.concat(chunks).toString();
+                bodies.push(body);
+                res.writeHead(200, { 'Content-Type': 'text/plain' });
+                res.end(`received:${body}`);
+            });
+        });
+        const postPort = await listen(postOrigin);
+
+        const postMirror = `.tmp-post-dedup-${process.pid}-${Date.now()}`;
+        const postDir = path.join(ROOT, postMirror);
+        fs.rmSync(postDir, { recursive: true, force: true });
+
+        const serverPath = require.resolve('../server');
+        delete require.cache[serverPath];
+        const postModule = loadServerWithEnv({
+            TARGET_HOST: `http://127.0.0.1:${postPort}`,
+            MIRROR_NAME: postMirror,
+            START_PATH: '/',
+            NO_OPEN: '1'
+        });
+
+        try {
+            const port = await listen(postModule.server);
+            const [r1, r2] = await Promise.all([
+                fetch(`http://127.0.0.1:${port}/${postMirror}/api`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain' },
+                    body: 'first'
+                }),
+                fetch(`http://127.0.0.1:${port}/${postMirror}/api`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain' },
+                    body: 'second'
+                })
+            ]);
+
+            assert.strictEqual(r1.status, 200);
+            assert.strictEqual(r2.status, 200);
+            // Both requests must reach the origin independently
+            assert.strictEqual(bodies.length, 2);
+            assert.ok(bodies.includes('first'));
+            assert.ok(bodies.includes('second'));
+        } finally {
+            await close(postModule.server);
+            await close(postOrigin);
+            fs.rmSync(postDir, { recursive: true, force: true });
+            delete require.cache[serverPath];
+        }
     });
 
     it('rejects unsupported methods before proxying', async () => {
         const port = await listen(mirrorServerModule.server);
-        const response = await fetch(`http://127.0.0.1:${port}/${mirrorName}/assets/app.js`, { method: 'POST' });
+        const response = await fetch(`http://127.0.0.1:${port}/${mirrorName}/assets/app.js`, { method: 'PUT' });
 
         assert.strictEqual(response.status, 405);
-        assert.strictEqual(response.headers.get('allow'), 'GET, HEAD, OPTIONS');
-        assert.match(await response.text(), /Method not allowed: POST/);
+        assert.strictEqual(response.headers.get('allow'), 'GET, HEAD, POST, OPTIONS');
+        assert.match(await response.text(), /Method not allowed: PUT/);
         assert.strictEqual(fs.existsSync(path.join(mirrorDir, 'assets', 'app.js')), false);
     });
 
@@ -190,6 +337,26 @@ describe('server integration', () => {
 
         assert.strictEqual(response.status, 502);
         assert.strictEqual(fs.existsSync(path.join(mirrorDir, 'bad.png')), false);
+    });
+
+    it('rejects resources above the configured max download size', async () => {
+        const serverPath = require.resolve('../server');
+        delete require.cache[serverPath];
+
+        mirrorServerModule = loadServerWithEnv({
+            TARGET_HOST: `http://127.0.0.1:${originPort}`,
+            MIRROR_NAME: mirrorName,
+            START_PATH: '/',
+            MIRROR_MAX_DOWNLOAD_BYTES: '8',
+            NO_OPEN: '1'
+        });
+
+        const port = await listen(mirrorServerModule.server);
+        const response = await fetch(`http://127.0.0.1:${port}/${mirrorName}/large.bin`);
+
+        assert.strictEqual(response.status, 502);
+        assert.match(await response.text(), /too large/i);
+        assert.strictEqual(fs.existsSync(path.join(mirrorDir, 'large.bin')), false);
     });
 
     it('ignores configured noisy request prefixes', async () => {
@@ -245,7 +412,7 @@ describe('server integration', () => {
 
     it('starts on the next available port when auto-port is enabled', async () => {
         const blocker = http.createServer((req, res) => res.end('busy'));
-        const blockedPort = await listenAny(blocker);
+        const blockedPort = await listen(blocker);
         const serverPath = require.resolve('../server');
         delete require.cache[serverPath];
 
@@ -315,5 +482,53 @@ describe('URL rewriting', () => {
     it('rewrites escaped external URLs without dropping escaped slashes', () => {
         const output = mirrorServerModule.rewriteExternalUrlsForLocalMirror('https:\\/\\/cdn.example.test\\/video.mp4');
         assert.strictEqual(output, '\\/example.test\\/cdn.example.test\\/video.mp4');
+    });
+
+    it('rewrites srcset attributes', () => {
+        const input = '<img srcset="/img-320w.jpg 320w, /img-640w.jpg 640w">';
+        const output = mirrorServerModule.rewriteTextForLocalMirror(input);
+        assert.match(output, /\/example\.test\/img-320w\.jpg/);
+        assert.match(output, /\/example\.test\/img-640w\.jpg/);
+        assert.match(output, /320w/);
+        assert.match(output, /640w/);
+    });
+
+    it('rewrites poster attribute', () => {
+        const input = '<video poster="/thumb.jpg"></video>';
+        const output = mirrorServerModule.rewriteTextForLocalMirror(input);
+        assert.match(output, /poster="\/example\.test\/thumb\.jpg"/);
+    });
+
+    it('rewrites action attribute', () => {
+        const input = '<form action="/submit">';
+        const output = mirrorServerModule.rewriteTextForLocalMirror(input);
+        assert.match(output, /action="\/example\.test\/submit"/);
+    });
+
+    it('rewrites data-src lazy-load attributes', () => {
+        const input = '<img data-src="/lazy.jpg" data-original="/full.jpg">';
+        const output = mirrorServerModule.rewriteTextForLocalMirror(input);
+        assert.match(output, /data-src="\/example\.test\/lazy\.jpg"/);
+        assert.match(output, /data-original="\/example\.test\/full\.jpg"/);
+    });
+
+    it('removes base href tag', () => {
+        const input = '<head><base href="https://www.example.test/"><link rel="stylesheet" href="/style.css"></head>';
+        const output = mirrorServerModule.rewriteTextForLocalMirror(input);
+        assert.doesNotMatch(output, /<base/);
+        assert.match(output, /\/example\.test\/style\.css/);
+    });
+
+    it('rewrites iframe src attribute', () => {
+        const input = '<iframe src="https://www.example.test/embed/video"></iframe>';
+        const output = mirrorServerModule.rewriteTextForLocalMirror(input);
+        assert.match(output, /\/example\.test\/embed\/video/);
+    });
+
+    it('rewrites JSON-escaped URLs', () => {
+        const input = '{"url":"https:\\/\\/www.example.test\\/api\\/data"}';
+        const output = mirrorServerModule.rewriteTextForLocalMirror(input);
+        assert.match(output, /example\.test/);
+        assert.doesNotMatch(output, /https:\/\/www\.example\.test/);
     });
 });

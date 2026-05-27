@@ -45,4 +45,5 @@ logs/
 .mirror-progress.json
 .mirror-progress-cms.json
 *.cookies.json
+.port
 CLAUDE.md

@@ -161,7 +161,8 @@ Common config example:
     "autoPort": true,
     "targetHost": "https://example.com",
     "mirrorName": "example.com",
-    "startPath": "/"
+    "startPath": "/",
+    "maxDownloadBytes": 268435456
 }
 ```
 
@@ -264,6 +265,29 @@ Whether the server should try the next available port when the configured port i
 
 Keeping this enabled is recommended, especially for double-click startup and non-technical users.
 
+### MAX_DOWNLOAD_BYTES
+
+Maximum size, in bytes, for a single remote resource that MirrorKit will cache.
+
+```json
+{
+    "maxDownloadBytes": 268435456
+}
+```
+
+The default is 256 MB. Resources above this limit are rejected and are not
+written into the local mirror.
+
+MirrorKit is intended for local research of page structure, styling, scripts,
+and necessary display assets. It is not intended to bulk-copy large third-party
+videos or complete media libraries.
+
+You can temporarily override the limit with an environment variable:
+
+```bat
+set MIRROR_MAX_DOWNLOAD_BYTES=104857600
+```
+
 ## 2. Tools
 
 All helper scripts are in `tools/`.
@@ -353,6 +377,7 @@ Fetching missing files from the remote site
 Saving fetched files locally
 Rewriting external links to local mirror paths
 Serving local videos and large files with byte-range requests
+Rejecting remote resources above maxDownloadBytes
 ```
 
 Run:
@@ -477,6 +502,9 @@ Normal video files
 wasm
 Compressed textures
 ```
+
+The downloader respects `maxDownloadBytes`. Oversized resources are marked as
+rejected and are not written into the local mirror.
 
 Run:
 

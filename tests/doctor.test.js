@@ -28,6 +28,9 @@ describe('doctor checks', () => {
     it('checks Node.js version', () => {
         assert.strictEqual(nodeVersionCheck('18.0.0').status, 'pass');
         assert.strictEqual(nodeVersionCheck('16.20.0').status, 'fail');
+        assert.strictEqual(nodeVersionCheck('v18.0.0').status, 'pass');
+        assert.strictEqual(nodeVersionCheck('v20.11.0').status, 'pass');
+        assert.strictEqual(nodeVersionCheck('v16.20.0').status, 'fail');
     });
 
     it('checks required files', () => {
