@@ -112,18 +112,6 @@ function getActiveRemoteAssetPrefixes() {
     return new Set([...REMOTE_ASSET_PREFIXES, ...BUILTIN_REMOTE_ASSET_PREFIXES]);
 }
 
-function getAllowedDomains() {
-    const domains = new Set();
-    try { domains.add(new URL(TARGET_HOST).hostname); } catch {}
-    for (const prefix of [...REMOTE_ASSET_PREFIXES, ...BUILTIN_REMOTE_ASSET_PREFIXES]) {
-        try { domains.add(new URL(prefix).hostname); } catch {}
-    }
-    for (const mirror of CONFIG.remoteMirrors) {
-        try { if (mirror.origin) domains.add(new URL(mirror.origin).hostname); } catch {}
-    }
-    return domains;
-}
-
 function localPathForAsset(assetPath) {
     return resolveLocalPathForAsset(assetPath, {
         rootDir: ROOT,
@@ -169,7 +157,7 @@ function collectBadCachedAssets() {
 
 function collectInitialAssets() {
     const assets = new Set(SEED_URLS);
-    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [...getActiveRemoteAssetPrefixes()], allowedDomains: getAllowedDomains() };
+    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [...getActiveRemoteAssetPrefixes()] };
 
     for (const filePath of collectLocalSources()) {
         const text = readTextIfExists(filePath);
@@ -284,7 +272,7 @@ async function main() {
         logger.error(`Could not generate launcher: ${err.message}`);
     }
 
-    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [...getActiveRemoteAssetPrefixes()], allowedDomains: getAllowedDomains() };
+    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [...getActiveRemoteAssetPrefixes()] };
 
     const result = await runMirrorWorkflow({
         collectInitialAssets,

@@ -91,18 +91,6 @@ describe('normalizeAssetPath', () => {
         assert.strictEqual(normalizeAssetPath('Loading target-vec.js', ASSET_EXTS), null);
         assert.strictEqual(normalizeAssetPath('Failed to fetch app.js', ASSET_EXTS), null);
     });
-
-    it('accepts allowed domain URLs', () => {
-        const domains = new Set(['cdn.example.com']);
-        assert.strictEqual(
-            normalizeAssetPath('https://cdn.example.com/app.js', ASSET_EXTS, domains),
-            'https://cdn.example.com/app.js'
-        );
-        assert.strictEqual(
-            normalizeAssetPath('https://other.com/app.js', ASSET_EXTS, domains),
-            null
-        );
-    });
 });
 
 describe('extractAssetPathsFromText', () => {
@@ -124,14 +112,6 @@ describe('extractAssetPathsFromText', () => {
         const text = '<img src="https://cdn.example.com/img/logo.png">';
         const result = extractAssetPathsFromText(text, { assetExts: ASSET_EXTS });
         assert.strictEqual(result.has('https://cdn.example.com/img/logo.png'), true);
-    });
-
-    it('filters external URLs by allowedDomains', () => {
-        const text = '<img src="https://cdn.example.com/a.png"><img src="https://other.com/b.png">';
-        const domains = new Set(['cdn.example.com']);
-        const result = extractAssetPathsFromText(text, { assetExts: ASSET_EXTS, allowedDomains: domains });
-        assert.strictEqual(result.has('https://cdn.example.com/a.png'), true);
-        assert.strictEqual(result.has('https://other.com/b.png'), false);
     });
 
     it('filters error message strings and bare filenames', () => {
@@ -163,14 +143,6 @@ describe('extractAssetPathsFromJson', () => {
         const result = extractAssetPathsFromJson(json, { assetExts: ASSET_EXTS });
         assert.strictEqual(result.has('img/logo.png'), true);
         assert.strictEqual(result.has('https://cdn.example.com/banner.jpg'), true);
-    });
-
-    it('filters external URLs by allowedDomains', () => {
-        const json = { img: 'https://cdn.example.com/a.png', other: 'https://other.com/b.png' };
-        const domains = new Set(['cdn.example.com']);
-        const result = extractAssetPathsFromJson(json, { assetExts: ASSET_EXTS, allowedDomains: domains });
-        assert.strictEqual(result.has('https://cdn.example.com/a.png'), true);
-        assert.strictEqual(result.has('https://other.com/b.png'), false);
     });
 
     it('extracts from arrays', () => {

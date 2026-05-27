@@ -117,16 +117,6 @@ function mirrorRoot() {
     return getMirrorRoot(ROOT, MIRROR_NAME);
 }
 
-function getAllowedDomains() {
-    const domains = new Set();
-    try { domains.add(new URL(TARGET_HOST).hostname); } catch {}
-    try { domains.add(new URL(CMS_HOST).hostname); } catch {}
-    for (const mirror of CONFIG.remoteMirrors) {
-        try { if (mirror.origin) domains.add(new URL(mirror.origin).hostname); } catch {}
-    }
-    return domains;
-}
-
 function cmsPrefix() {
     return `${CMS_HOST.replace(/\/+$/, '')}/`;
 }
@@ -217,7 +207,7 @@ function collectBadCachedAssets() {
 function collectInitialAssets() {
     const assets = new Set();
     const cacheId = findCacheId();
-    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [cmsPrefix()], allowedDomains: getAllowedDomains() };
+    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [cmsPrefix()] };
 
     assets.add(`assets/js/app.${cacheId}.js`);
     assets.add(`assets/js/modules.${cacheId}.js`);
@@ -342,7 +332,7 @@ async function main() {
         logger.error(`Could not generate launcher: ${err.message}`);
     }
 
-    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [cmsPrefix()], allowedDomains: getAllowedDomains() };
+    const extractOpts = { assetExts: ASSET_EXTS, loosePrefixes: [cmsPrefix()] };
 
     const result = await runMirrorWorkflow({
         collectInitialAssets,
