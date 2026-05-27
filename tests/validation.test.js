@@ -126,4 +126,14 @@ describe('isValidDownload', () => {
         const buf = Buffer.from('<!doctype html><html><title>Home</title></html>');
         assert.strictEqual(isValidDownload('/about', fakeResponse(), buf), true);
     });
+
+    it('accepts SVG files with HTML-like content', () => {
+        const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><title>Logo</title></svg>');
+        assert.strictEqual(isValidDownload('/logo.svg', fakeResponse('image/svg+xml'), svg), true);
+    });
+
+    it('accepts SVG files without content-type', () => {
+        const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><title>Logo</title></svg>');
+        assert.strictEqual(isValidDownload('/logo.svg', fakeResponse(), svg), true);
+    });
 });
