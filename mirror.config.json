@@ -1,8 +1,8 @@
 {
     "port": 3000,
     "autoPort": true,
-    "targetHost": "https://example.com",
-    "mirrorName": "example.com",
+    "targetHost": "https://www.apple.com",
+    "mirrorName": "apple.com",
     "startPath": "/",
     "requestTimeoutMs": 30000,
     "concurrency": 6,

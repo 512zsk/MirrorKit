@@ -41,6 +41,8 @@ logs/
 *.bad
 *.tmp
 *.log
+.tmp-*/
 .mirror-progress.json
 .mirror-progress-cms.json
+*.cookies.json
 CLAUDE.md

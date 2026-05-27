@@ -264,6 +264,42 @@ http://localhost:3000/xxx.com/zh
 
 建议保持开启，尤其是双击启动或给非技术用户使用时。
 
+### 5. FORWARD_COOKIES
+
+需要登录才能访问的网站，开启 Cookie 转发。
+
+```json
+{
+    "forwardCookies": true
+}
+```
+
+开启后：
+
+```text
+启动服务器时自动清空旧日志和旧 Cookie
+通过代理浏览目标站点并登录，代理自动捕获 Set-Cookie 存入 <mirrorName>/.cookies.json
+运行 mirror-assets.js 时自动加载 Cookie，爬取登录后才能看到的页面
+```
+
+使用流程：
+
+```text
+1. mirror.config.json 设置 "forwardCookies": true
+2. node server.js 启动代理
+3. 浏览器通过代理访问目标站点并登录
+4. 登录完成后运行 node tools\mirror-assets.js --resume
+5. 爬虫自动使用已保存的 Cookie 进行认证爬取
+```
+
+注意：
+
+```text
+Cookie jar 只存储目标域名及子域名的 Cookie，不会存储第三方 Cookie
+浏览器请求中的 Cookie 优先于 jar 中的同名 Cookie
+不开启 forwardCookies 时，所有行为与之前完全一致，零开销
+```
+
 ## 二、工具怎么用
 
 工具都在 `tools/` 文件夹里。
@@ -947,6 +983,22 @@ node tools\export-standalone.js --config sites/site-a.json --check
 ```text
 http://localhost:3000/
 ```
+
+### 需要登录的网站
+
+配置中设置 `"forwardCookies": true`，然后：
+
+```bat
+node server.js --config sites/site-a.json
+```
+
+通过代理浏览器访问目标站点，完成登录。登录完成后：
+
+```bat
+node tools\mirror-assets.js --config sites/site-a.json --resume
+```
+
+爬虫会自动使用已保存的 Cookie 爬取登录后才能看到的页面。
 
 ### 只想边打开边自动补资源
 

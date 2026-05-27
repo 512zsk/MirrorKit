@@ -12,6 +12,7 @@ const { createFileLogger } = require('../lib/file-logger');
 const { runMirrorWorkflow } = require('../lib/mirror-runner');
 const { createFileInventory, createMirrorManifest, writeMirrorManifest } = require('../lib/manifest');
 const { generateLauncher } = require('../lib/generate-launcher');
+const { CookieJar } = require('../lib/cookie-jar');
 
 const ROOT = path.resolve(__dirname, '..');
 const CONFIG = loadMirrorConfig(ROOT);
@@ -50,6 +51,20 @@ const fileLogger = createFileLogger({
 });
 const logger = createCliLogger({ quiet: SHOULD_QUIET, json: SHOULD_JSON_LOG, fileLogger });
 const LOG_FILE_LABEL = fileLogger.logFile ? path.relative(ROOT, fileLogger.logFile) : 'disabled';
+
+const COOKIE_JAR_PATH = path.join(ROOT, MIRROR_NAME, '.cookies.json');
+let cookieHeader = '';
+if (CONFIG.forwardCookies) {
+    fileLogger.clear();
+    const jar = new CookieJar();
+    jar.loadFromFile(COOKIE_JAR_PATH);
+    cookieHeader = jar.getCookiesForUrl(TARGET_HOST);
+    if (cookieHeader) {
+        logger.status(`Loaded cookies from ${COOKIE_JAR_PATH}`);
+    } else {
+        logger.status(`Cookie forwarding enabled but no cookies found in jar.`);
+    }
+}
 
 if (args.has('--help') || args.has('-h')) {
     console.log(`MirrorKit batch asset downloader
@@ -194,7 +209,8 @@ async function downloadAsset(assetPath) {
     const response = await fetchWithRetries(url, {
         timeoutMs: TIMEOUT_MS,
         referer: TARGET_HOST,
-        retries: DOWNLOAD_RETRIES
+        retries: DOWNLOAD_RETRIES,
+        cookie: cookieHeader || undefined
     });
     if (!response.ok) {
         return { status: 'fail', assetPath, message: `HTTP ${response.status}` };

@@ -15,6 +15,7 @@ const { argValue, loadMirrorConfig, printConfigProblems, validateMirrorConfig } 
 const { safeDecodeURIComponent, safeJoin } = require('./lib/paths');
 const { createFileLogger } = require('./lib/file-logger');
 const { generateLauncher } = require('./lib/generate-launcher');
+const { CookieJar, parseCookies } = require('./lib/cookie-jar');
 
 const serverFileLogger = createFileLogger({
     rootDir: __dirname,
@@ -46,6 +47,14 @@ const REMOTE_MIRRORS = CONFIG.remoteMirrors;
 const BUILTIN_REMOTE_MIRRORS = [];
 
 const IGNORED_PATH_PREFIXES = CONFIG.ignoredPathPrefixes;
+
+const COOKIE_JAR_PATH = path.join(__dirname, MIRROR_NAME, '.cookies.json');
+let cookieJar = null;
+if (CONFIG.forwardCookies) {
+    cookieJar = new CookieJar();
+    try { fs.unlinkSync(COOKIE_JAR_PATH); } catch { /* ignore */ }
+    serverFileLogger.clear();
+}
 
 // ====== 通用规则区：不是某个网站专用，不要随便删 ======
 const SITE_PATH_PREFIXES = new Set(CONFIG.sitePathPrefixes);
@@ -454,7 +463,20 @@ async function proxyAndCache(req, res, localPath, reqPath) {
     logger('cache', `Cache miss: ${req.url} -> ${targetUrl}`);
 
     try {
-        const response = await fetchWithTimeout(targetUrl, { timeoutMs: REQUEST_TIMEOUT_MS, referer: TARGET_HOST, acceptEncoding: 'gzip, deflate' });
+        let upstreamCookie;
+        if (CONFIG.forwardCookies && cookieJar) {
+            const browserCookie = req.headers['cookie'] || '';
+            const jarCookie = cookieJar.getCookiesForUrl(targetUrl);
+            if (browserCookie && jarCookie) {
+                const browserNames = new Set(browserCookie.split(';').map(c => c.trim().split('=')[0]));
+                const jarParts = jarCookie.split(';').filter(c => !browserNames.has(c.trim().split('=')[0]));
+                upstreamCookie = [browserCookie, ...jarParts].join('; ');
+            } else {
+                upstreamCookie = browserCookie || jarCookie || undefined;
+            }
+        }
+
+        const response = await fetchWithTimeout(targetUrl, { timeoutMs: REQUEST_TIMEOUT_MS, referer: TARGET_HOST, acceptEncoding: 'gzip, deflate', cookie: upstreamCookie });
 
         if (!response.ok) {
             logger('error', `Origin status ${response.status}: ${req.url}`);
@@ -472,6 +494,20 @@ async function proxyAndCache(req, res, localPath, reqPath) {
             return;
         }
 
+        if (CONFIG.forwardCookies && cookieJar) {
+            const setCookieValues = typeof response.headers.getSetCookie === 'function'
+                ? response.headers.getSetCookie()
+                : [];
+            if (setCookieValues.length) {
+                for (const headerValue of setCookieValues) {
+                    for (const cookie of parseCookies(headerValue, targetUrl)) {
+                        cookieJar.addCookie(cookie);
+                    }
+                }
+                cookieJar.saveToFile(COOKIE_JAR_PATH);
+            }
+        }
+
         ensureDirExists(localPath);
         await fs.promises.writeFile(localPath, buffer);
         logger('success', `Saved: ${localPath}`);
@@ -481,11 +517,22 @@ async function proxyAndCache(req, res, localPath, reqPath) {
             return;
         }
 
-        await sendResponse(req, res, 200, {
+        const responseHeaders = {
             'Content-Type': getContentType(localPath, buffer),
             'Accept-Ranges': 'bytes',
             'Access-Control-Allow-Origin': '*'
-        }, buffer);
+        };
+
+        if (CONFIG.forwardCookies) {
+            const setCookieValues = typeof response.headers.getSetCookie === 'function'
+                ? response.headers.getSetCookie()
+                : [];
+            if (setCookieValues.length) {
+                res.setHeader('Set-Cookie', setCookieValues);
+            }
+        }
+
+        await sendResponse(req, res, 200, responseHeaders, buffer);
     } catch (err) {
         const status = err.name === 'AbortError' ? 504 : 500;
         logger('error', `${req.url}: ${err.message}`);
@@ -588,6 +635,9 @@ function printStartupInfo(port = getBoundPort()) {
     console.log(`Mirror entry: \x1b[32mhttp://localhost:${port}${getMirrorEntryPath()}\x1b[0m`);
     console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms`);
     console.log(`Log file: ${serverFileLogger.logFile || 'disabled'}`);
+    if (CONFIG.forwardCookies) {
+        console.log(`Cookie forwarding: \x1b[32menabled\x1b[0m (jar: ${COOKIE_JAR_PATH})`);
+    }
     console.log('Unexpected HTML fallback responses will not be cached as assets.');
     console.log('----------------------------------------------------------\n');
 }
