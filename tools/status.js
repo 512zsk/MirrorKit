@@ -1,5 +1,5 @@
 const path = require('path');
-const { loadMirrorConfig } = require('../lib/config');
+const { loadMirrorConfig, argValue, numberFrom } = require('../lib/config');
 const { createStatusReport } = require('../lib/status');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -24,21 +24,6 @@ Checks:
   doctor, mirror folder, invalid assets, manifests, and log health.
 `);
     process.exit(0);
-}
-
-function argValue(name) {
-    const eqPrefix = `${name}=`;
-    const eqValue = argv.find(arg => arg.startsWith(eqPrefix));
-    if (eqValue) return eqValue.slice(eqPrefix.length);
-
-    const index = argv.indexOf(name);
-    if (index !== -1 && argv[index + 1] && !argv[index + 1].startsWith('-')) return argv[index + 1];
-    return null;
-}
-
-function numberFrom(value, fallback) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function printHuman(report) {
@@ -75,7 +60,7 @@ function printHuman(report) {
 }
 
 createStatusReport(ROOT, CONFIG, {
-    logLimit: numberFrom(argValue('--log-limit'), 20)
+    logLimit: numberFrom(argValue(argv, '--log-limit'), 20)
 }).then(report => {
     if (SHOULD_JSON) console.log(JSON.stringify(report));
     else printHuman(report);

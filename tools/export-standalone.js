@@ -1,6 +1,6 @@
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { loadMirrorConfig, printConfigProblems, validateMirrorConfig } = require('../lib/config');
+const { loadMirrorConfig, argValue, printConfigProblems, validateMirrorConfig } = require('../lib/config');
 const { defaultStandaloneOutDir, exportStandaloneProject } = require('../lib/standalone-export');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -27,16 +27,6 @@ It does not include MirrorKit crawler tools, tests, or library source.
     process.exit(0);
 }
 
-function argValue(argv, name) {
-    const eqPrefix = `${name}=`;
-    const eqValue = argv.find(arg => arg.startsWith(eqPrefix));
-    if (eqValue) return eqValue.slice(eqPrefix.length);
-
-    const index = argv.indexOf(name);
-    if (index !== -1 && argv[index + 1] && !argv[index + 1].startsWith('-')) return argv[index + 1];
-    return null;
-}
-
 function runStandaloneCheck(outDir) {
     return spawnSync(process.execPath, ['server.js', '--check'], {
         cwd: outDir,
@@ -44,7 +34,7 @@ function runStandaloneCheck(outDir) {
     });
 }
 
-function main() {
+async function main() {
     const problems = validateMirrorConfig(CONFIG);
     if (problems.length) {
         printConfigProblems(problems);
@@ -56,7 +46,7 @@ function main() {
     const outDir = outArg ? path.resolve(ROOT, outArg) : defaultStandaloneOutDir(ROOT, CONFIG.mirrorName);
 
     try {
-        const result = exportStandaloneProject({
+        const result = await exportStandaloneProject({
             rootDir: ROOT,
             config: CONFIG,
             outDir,

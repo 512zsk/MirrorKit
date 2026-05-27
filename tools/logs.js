@@ -1,6 +1,7 @@
 const path = require('path');
 const { DEFAULT_LOG_FILES, createLogReport } = require('../lib/log-report');
 const { isInsidePath } = require('../lib/paths');
+const { argValue, numberFrom } = require('../lib/config');
 
 const ROOT = path.resolve(__dirname, '..');
 const argv = process.argv.slice(2);
@@ -24,16 +25,6 @@ By default, this reads:
     process.exit(0);
 }
 
-function argValue(name) {
-    const eqPrefix = `${name}=`;
-    const eqValue = argv.find(arg => arg.startsWith(eqPrefix));
-    if (eqValue) return eqValue.slice(eqPrefix.length);
-
-    const index = argv.indexOf(name);
-    if (index !== -1 && argv[index + 1] && !argv[index + 1].startsWith('-')) return argv[index + 1];
-    return null;
-}
-
 function positionalArgs() {
     const output = [];
     for (let index = 0; index < argv.length; index++) {
@@ -46,11 +37,6 @@ function positionalArgs() {
         if (!arg.startsWith('--')) output.push(arg);
     }
     return output;
-}
-
-function numberFrom(value, fallback) {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function validateFiles(files) {
@@ -107,7 +93,7 @@ function printHuman(report) {
 function main() {
     const files = positionalArgs();
     const selectedFiles = files.length ? files : DEFAULT_LOG_FILES;
-    const limit = numberFrom(argValue('--limit'), 20);
+    const limit = numberFrom(argValue(argv, '--limit'), 20);
 
     try {
         validateFiles(selectedFiles);

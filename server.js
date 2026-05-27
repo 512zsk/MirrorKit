@@ -2,7 +2,11 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
+const { promisify } = require('util');
 const { exec } = require('child_process');
+
+const gzipAsync = promisify(zlib.gzip);
+const deflateAsync = promisify(zlib.deflate);
 const { DEFAULT_ASSET_EXTS, MIME_TYPES } = require('./lib/constants');
 const { isHtmlLike, isValidDownload } = require('./lib/validation');
 const { fetchWithTimeout } = require('./lib/fetch');
@@ -107,9 +111,9 @@ function acceptEncoding(req) {
     return null;
 }
 
-function compressBody(encoding, data) {
-    if (encoding === 'gzip') return zlib.gzipSync(data);
-    if (encoding === 'deflate') return zlib.deflateSync(data);
+async function compressBody(encoding, data) {
+    if (encoding === 'gzip') return gzipAsync(data);
+    if (encoding === 'deflate') return deflateAsync(data);
     return data;
 }
 
@@ -189,12 +193,12 @@ function serveFileRange(filePath, req, res, stat, etag) {
         .pipe(res);
 }
 
-function sendResponse(req, res, status, headers, data) {
+async function sendResponse(req, res, status, headers, data) {
     const contentType = headers['Content-Type'] || '';
     const encoding = acceptEncoding(req);
 
     if (encoding && isCompressible(contentType) && data && data.length > 1024) {
-        data = compressBody(encoding, data);
+        data = await compressBody(encoding, data);
         headers['Content-Encoding'] = encoding;
     }
 
@@ -222,9 +226,9 @@ function sendMethodNotAllowed(req, res) {
     res.end(req.method === 'HEAD' ? undefined : `Method not allowed: ${req.method}`);
 }
 
-function serveLocalFile(filePath, req, res) {
+async function serveLocalFile(filePath, req, res) {
     try {
-        const stat = fs.statSync(filePath);
+        const stat = await fs.promises.stat(filePath);
         const etag = `"${stat.size.toString(16)}-${stat.mtimeMs.toString(16)}"`;
 
         if (req.headers['if-none-match'] === etag) {
@@ -242,32 +246,28 @@ function serveLocalFile(filePath, req, res) {
             return;
         }
 
-        fs.readFile(filePath, (err, data) => {
-            if (err) {
-                res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-                res.end(`Error reading file: ${err.code}`);
-                return;
-            }
+        let data = await fs.promises.readFile(filePath);
 
-            const ext = path.extname(filePath).toLowerCase();
-            if (REWRITE_TEXT_EXTS.has(ext) || ext === '') {
-                data = Buffer.from(rewriteTextForLocalMirror(data.toString('utf8')));
-            } else if (EXTERNAL_URL_REWRITE_TEXT_EXTS.has(ext)) {
-                data = Buffer.from(rewriteExternalUrlsForLocalMirror(data.toString('utf8')));
-            }
+        const ext = path.extname(filePath).toLowerCase();
+        if (REWRITE_TEXT_EXTS.has(ext) || ext === '') {
+            data = Buffer.from(rewriteTextForLocalMirror(data.toString('utf8')));
+        } else if (EXTERNAL_URL_REWRITE_TEXT_EXTS.has(ext)) {
+            data = Buffer.from(rewriteExternalUrlsForLocalMirror(data.toString('utf8')));
+        }
 
-            sendResponse(req, res, 200, {
-                'Content-Type': getContentType(filePath, data),
-                'Cache-Control': 'public, max-age=31536000',
-                'ETag': etag,
-                'Last-Modified': stat.mtime.toUTCString(),
-                'Accept-Ranges': 'bytes',
-                'Access-Control-Allow-Origin': '*'
-            }, data);
-        });
+        await sendResponse(req, res, 200, {
+            'Content-Type': getContentType(filePath, data),
+            'Cache-Control': 'public, max-age=31536000',
+            'ETag': etag,
+            'Last-Modified': stat.mtime.toUTCString(),
+            'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*'
+        }, data);
     } catch (err) {
-        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-        res.end(`Error reading file: ${err.code || err.message}`);
+        if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end(`Error reading file: ${err.code || err.message}`);
+        }
     }
 }
 
@@ -396,6 +396,31 @@ function getGoogleStorageTargetUrl(reqPath, search) {
     return null;
 }
 
+function getAllowedHosts() {
+    const hosts = new Set();
+    try {
+        hosts.add(new URL(TARGET_HOST).hostname);
+    } catch {}
+    for (const mirror of REMOTE_MIRRORS) {
+        try {
+            if (mirror.origin) hosts.add(new URL(mirror.origin).hostname);
+        } catch {}
+    }
+    try {
+        hosts.add(new URL(CONFIG.cmsMediaHost).hostname);
+    } catch {}
+    return hosts;
+}
+
+function isAllowedTargetHost(urlString) {
+    try {
+        const hostname = new URL(urlString).hostname;
+        return getAllowedHosts().has(hostname);
+    } catch {
+        return false;
+    }
+}
+
 function getTargetUrl(req, reqPath) {
     const requestUrl = new URL(req.url, `http://localhost:${getBoundPort()}`);
     const targetPath = isMirrorRequest(reqPath) ? stripMirrorPrefix(reqPath) : reqPath;
@@ -410,7 +435,9 @@ function getTargetUrl(req, reqPath) {
 
     const parts = targetPath.split('/').filter(Boolean);
     if (parts.length > 1 && looksLikeMirroredRemoteHost(parts[0]) && !SITE_PATH_PREFIXES.has(parts[0])) {
-        return `https://${parts[0]}/${parts.slice(1).join('/')}${requestUrl.search}`;
+        const url = `https://${parts[0]}/${parts.slice(1).join('/')}${requestUrl.search}`;
+        if (!isAllowedTargetHost(url)) return null;
+        return url;
     }
 
     return `${TARGET_HOST}${targetPath}${requestUrl.search}`;
@@ -418,10 +445,16 @@ function getTargetUrl(req, reqPath) {
 
 async function proxyAndCache(req, res, localPath, reqPath) {
     const targetUrl = getTargetUrl(req, reqPath);
+    if (!targetUrl) {
+        logger('error', `SSRF rejected: ${req.url}`);
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Forbidden: target host not allowed');
+        return;
+    }
     logger('cache', `Cache miss: ${req.url} -> ${targetUrl}`);
 
     try {
-        const response = await fetchWithTimeout(targetUrl, { timeoutMs: REQUEST_TIMEOUT_MS, referer: TARGET_HOST });
+        const response = await fetchWithTimeout(targetUrl, { timeoutMs: REQUEST_TIMEOUT_MS, referer: TARGET_HOST, acceptEncoding: 'gzip, deflate' });
 
         if (!response.ok) {
             logger('error', `Origin status ${response.status}: ${req.url}`);
@@ -443,12 +476,12 @@ async function proxyAndCache(req, res, localPath, reqPath) {
         await fs.promises.writeFile(localPath, buffer);
         logger('success', `Saved: ${localPath}`);
 
-        if (req.headers.range && fs.existsSync(localPath) && fs.statSync(localPath).isFile() && canServeRange(localPath)) {
+        if (req.headers.range && canServeRange(localPath)) {
             serveLocalFile(localPath, req, res);
             return;
         }
 
-        sendResponse(req, res, 200, {
+        await sendResponse(req, res, 200, {
             'Content-Type': getContentType(localPath, buffer),
             'Accept-Ranges': 'bytes',
             'Access-Control-Allow-Origin': '*'
@@ -532,9 +565,14 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (fs.existsSync(localPath) && fs.statSync(localPath).isFile()) {
-        serveLocalFile(localPath, req, res);
-        return;
+    try {
+        const stat = await fs.promises.stat(localPath);
+        if (stat.isFile()) {
+            await serveLocalFile(localPath, req, res);
+            return;
+        }
+    } catch {
+        // File doesn't exist, fall through to proxy
     }
 
     await proxyAndCache(req, res, localPath, reqPath);

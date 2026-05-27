@@ -49,9 +49,9 @@ describe('exportStandaloneProject', () => {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it('exports a self-contained offline project without crawler files', () => {
+    it('exports a self-contained offline project without crawler files', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        const result = exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        const result = await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
 
         assert.strictEqual(result.entryPath, '/example.test/');
         assert.strictEqual(fs.existsSync(path.join(outDir, 'server.js')), true);
@@ -91,9 +91,9 @@ describe('exportStandaloneProject', () => {
         assert.strictEqual(syntax.status, 0, syntax.stderr);
     });
 
-    it('prints standalone server help without starting the server', () => {
+    it('prints standalone server help without starting the server', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
 
         const result = spawnSync(process.execPath, ['server.js', '--help'], {
             cwd: outDir,
@@ -109,9 +109,9 @@ describe('exportStandaloneProject', () => {
         assert.match(result.stdout, /does not include crawler tools/);
     });
 
-    it('lets the exported project check itself without MirrorKit helpers', () => {
+    it('lets the exported project check itself without MirrorKit helpers', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
 
         const result = spawnSync(process.execPath, ['server.js', '--check'], {
             cwd: outDir,
@@ -127,9 +127,9 @@ describe('exportStandaloneProject', () => {
         assert.strictEqual(report.checks.some(check => check.name === 'manifest' && check.ok), true);
     });
 
-    it('fails the exported self-check when the entry file is missing', () => {
+    it('fails the exported self-check when the entry file is missing', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
         fs.rmSync(path.join(outDir, config.mirrorName, 'index.html'));
 
         const result = spawnSync(process.execPath, ['server.js', '--check'], {
@@ -143,9 +143,9 @@ describe('exportStandaloneProject', () => {
         assert.strictEqual(report.checks.some(check => check.name === 'entry-file' && !check.ok), true);
     });
 
-    it('fails the exported self-check when the manifest is missing', () => {
+    it('fails the exported self-check when the manifest is missing', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
         fs.rmSync(path.join(outDir, config.mirrorName, '.mirror-manifest.json'));
 
         const result = spawnSync(process.execPath, ['server.js', '--check'], {
@@ -161,9 +161,9 @@ describe('exportStandaloneProject', () => {
         assert.strictEqual(manifestCheck.details.error, 'manifest file not found');
     });
 
-    it('fails the exported self-check when a mirrored file changes', () => {
+    it('fails the exported self-check when a mirrored file changes', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
         fs.writeFileSync(path.join(outDir, config.mirrorName, 'assets', 'app.js'), 'window.offline = false;');
 
         const result = spawnSync(process.execPath, ['server.js', '--check'], {
@@ -181,7 +181,7 @@ describe('exportStandaloneProject', () => {
 
     it('serves exported files with the standalone server only', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
 
         const serverPath = path.join(outDir, 'server.js');
         const previousLogFile = process.env.MIRRORKIT_LOG_FILE;
@@ -234,9 +234,9 @@ describe('exportStandaloneProject', () => {
         }
     });
 
-    it('prints actionable standalone server startup errors', () => {
+    it('prints actionable standalone server startup errors', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
 
         const serverPath = path.join(outDir, 'server.js');
         delete require.cache[serverPath];
@@ -255,9 +255,9 @@ describe('exportStandaloneProject', () => {
         }
     });
 
-    it('rotates standalone logs without MirrorKit helper files', () => {
+    it('rotates standalone logs without MirrorKit helper files', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
 
         const serverPath = path.join(outDir, 'server.js');
         const previousLogFile = process.env.MIRRORKIT_LOG_FILE;
@@ -287,38 +287,38 @@ describe('exportStandaloneProject', () => {
         }
     });
 
-    it('refuses to overwrite an existing output folder unless force is set', () => {
+    it('refuses to overwrite an existing output folder unless force is set', async () => {
         const outDir = path.join(tmpDir, 'exports', 'example-offline');
-        exportStandaloneProject({ rootDir: tmpDir, config, outDir });
+        await exportStandaloneProject({ rootDir: tmpDir, config, outDir });
 
-        assert.throws(
+        await assert.rejects(
             () => exportStandaloneProject({ rootDir: tmpDir, config, outDir }),
             /output folder already exists/
         );
 
-        assert.doesNotThrow(() => exportStandaloneProject({ rootDir: tmpDir, config, outDir, force: true }));
+        await assert.doesNotReject(() => exportStandaloneProject({ rootDir: tmpDir, config, outDir, force: true }));
     });
 
-    it('refuses unsafe standalone output directories', () => {
+    it('refuses unsafe standalone output directories', async () => {
         const mirrorDir = path.join(tmpDir, config.mirrorName);
 
-        assert.throws(
+        await assert.rejects(
             () => exportStandaloneProject({ rootDir: tmpDir, config, outDir: tmpDir, force: true }),
             /output folder cannot be the MirrorKit project root/
         );
 
-        assert.throws(
+        await assert.rejects(
             () => exportStandaloneProject({ rootDir: tmpDir, config, outDir: path.join(mirrorDir, 'offline'), force: true }),
             /output folder cannot be inside the source mirror folder/
         );
     });
 
-    it('refuses to force-replace folders that were not standalone exports', () => {
+    it('refuses to force-replace folders that were not standalone exports', async () => {
         const outDir = path.join(tmpDir, 'existing-work');
         fs.mkdirSync(outDir, { recursive: true });
         fs.writeFileSync(path.join(outDir, 'keep.txt'), 'do not delete');
 
-        assert.throws(
+        await assert.rejects(
             () => exportStandaloneProject({ rootDir: tmpDir, config, outDir, force: true }),
             /refusing to replace a folder that was not created by MirrorKit standalone export/
         );
@@ -326,8 +326,8 @@ describe('exportStandaloneProject', () => {
         assert.strictEqual(fs.existsSync(path.join(outDir, 'keep.txt')), true);
     });
 
-    it('fails clearly when the mirror folder does not exist', () => {
-        assert.throws(
+    it('fails clearly when the mirror folder does not exist', async () => {
+        await assert.rejects(
             () => exportStandaloneProject({
                 rootDir: tmpDir,
                 config: { ...config, mirrorName: 'missing.test' },
