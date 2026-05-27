@@ -354,25 +354,25 @@ async function main() {
         shouldStop: () => shouldStop
     });
 
-    if (result.stopped) process.exit(0);
-
-    if (result.completed) {
-        try {
-            writeMirrorManifest(MANIFEST_FILE, createMirrorManifest({
-                tool: 'mirror-cms-media',
-                targetHost: TARGET_HOST,
-                mirrorName: MIRROR_NAME,
-                cmsMediaHost: CMS_HOST,
-                stats: result.stats,
-                resources: result.seen,
-                pending: [...result.pending].filter(item => !result.seen.has(item)),
-                files: createFileInventory(mirrorRoot()),
-                scannedUniqueResources: result.seen.size
-            }));
-        } catch (err) {
-            logger.error(`Could not write manifest: ${err.message}`);
-        }
+    const completed = result.completed === true;
+    try {
+        writeMirrorManifest(MANIFEST_FILE, createMirrorManifest({
+            tool: 'mirror-cms-media',
+            targetHost: TARGET_HOST,
+            mirrorName: MIRROR_NAME,
+            cmsMediaHost: CMS_HOST,
+            completed,
+            stats: result.stats,
+            resources: result.seen,
+            pending: [...result.pending].filter(item => !result.seen.has(item)),
+            files: createFileInventory(mirrorRoot()),
+            scannedUniqueResources: result.seen.size
+        }));
+    } catch (err) {
+        logger.error(`Could not write manifest: ${err.message}`);
     }
+
+    if (result.stopped) process.exit(0);
 
     if (result.incomplete) {
         process.exitCode = 2;
